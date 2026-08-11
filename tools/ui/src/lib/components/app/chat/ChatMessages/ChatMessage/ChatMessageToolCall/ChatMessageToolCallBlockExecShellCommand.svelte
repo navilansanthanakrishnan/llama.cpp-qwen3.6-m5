@@ -13,17 +13,16 @@
 	import { SETTINGS_KEYS, TOOL_RUNTIME_SCROLL_AT_BOTTOM_THRESHOLD_PX } from '$lib/constants';
 	import { config } from '$lib/stores/settings.svelte';
 	import { toolsStore } from '$lib/stores/tools.svelte';
+	import type { AgenticSection, ToolResultLine } from '$lib/types';
 	import type { DatabaseMessageExtra } from '$lib/types';
 	import {
 		abbreviateHome,
-		type AgenticSection,
 		type ExecShellExitStatus,
 		highlightCode,
 		isExitCodeSummaryLine,
 		parseExecShellCommandError,
 		parseExecShellCommandExitStatus,
-		parseToolResultWithImages,
-		type ToolResultLine
+		parseToolResultWithImages
 	} from '$lib/utils';
 
 	interface Props {

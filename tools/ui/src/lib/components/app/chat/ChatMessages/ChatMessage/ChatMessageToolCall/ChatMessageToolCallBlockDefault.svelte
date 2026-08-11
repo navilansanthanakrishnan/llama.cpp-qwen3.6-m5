@@ -8,9 +8,9 @@
 	import { MarkdownContent, SyntaxHighlightedCode } from '$lib/components/app';
 	import { MAX_HEIGHT_CODE_BLOCK } from '$lib/constants';
 	import { FileTypeText, ToolResultKind } from '$lib/enums';
+	import type { AgenticSection } from '$lib/types';
 	import type { DatabaseMessageExtra } from '$lib/types';
 	import {
-		type AgenticSection,
 		classifyToolResult,
 		formatJsonPretty,
 		getBuiltinToolUi,
