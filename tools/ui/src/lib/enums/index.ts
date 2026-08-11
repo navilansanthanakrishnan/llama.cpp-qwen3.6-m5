@@ -1,4 +1,5 @@
 export {
+	AttachmentLabel,
 	AttachmentType,
 	AttachmentMenuItemId,
 	AttachmentItemEnabledWhen,
@@ -43,9 +44,6 @@ export {
 	FileExtensionAudio,
 	FileExtensionPdf,
 	FileExtensionText,
-	MimeTypePrefix,
-	MimeTypeIncludes,
-	UriPattern,
 	MimeTypeApplication,
 	MimeTypeAudio,
 	MimeTypeVideo,

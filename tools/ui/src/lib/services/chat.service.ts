@@ -4,9 +4,6 @@ import {
 	API_CHAT,
 	API_SLOTS,
 	API_STREAM,
-	ATTACHMENT_LABEL_MCP_PROMPT,
-	ATTACHMENT_LABEL_MCP_RESOURCE,
-	ATTACHMENT_LABEL_PDF_FILE,
 	CONTROL_ACTION,
 	LEGACY_AGENTIC_REGEX,
 	REASONING_EFFORT_TOKENS,
@@ -18,6 +15,7 @@ import {
 	STREAM_VISIBILITY_KICK_MS
 } from '$lib/constants';
 import {
+	AttachmentLabel,
 	AttachmentType,
 	ContentPartType,
 	FileTypeAudio,
@@ -1313,7 +1311,7 @@ export class ChatService {
 
 		for (const textFile of textFiles) {
 			contentParts.push({
-				text: formatAttachmentText('File', textFile.name, textFile.content),
+				text: formatAttachmentText(AttachmentLabel.FILE, textFile.name, textFile.content),
 				type: ContentPartType.TEXT
 			});
 		}
@@ -1326,7 +1324,7 @@ export class ChatService {
 
 		for (const legacyContextFile of legacyContextFiles) {
 			contentParts.push({
-				text: formatAttachmentText('File', legacyContextFile.name, legacyContextFile.content),
+				text: formatAttachmentText(AttachmentLabel.FILE, legacyContextFile.name, legacyContextFile.content),
 				type: ContentPartType.TEXT
 			});
 		}
@@ -1404,7 +1402,7 @@ export class ChatService {
 				}
 			} else {
 				contentParts.push({
-					text: formatAttachmentText(ATTACHMENT_LABEL_PDF_FILE, pdfFile.name, pdfFile.content),
+					text: formatAttachmentText(AttachmentLabel.PDF_FILE, pdfFile.name, pdfFile.content),
 					type: ContentPartType.TEXT
 				});
 			}
@@ -1418,7 +1416,7 @@ export class ChatService {
 		for (const mcpPrompt of mcpPrompts) {
 			contentParts.push({
 				text: formatAttachmentText(
-					ATTACHMENT_LABEL_MCP_PROMPT,
+					AttachmentLabel.MCP_PROMPT,
 					mcpPrompt.name,
 					mcpPrompt.content,
 					mcpPrompt.serverName
@@ -1435,7 +1433,7 @@ export class ChatService {
 		for (const mcpResource of mcpResources) {
 			contentParts.push({
 				text: formatAttachmentText(
-					ATTACHMENT_LABEL_MCP_RESOURCE,
+					AttachmentLabel.MCP_RESOURCE,
 					mcpResource.name,
 					mcpResource.content,
 					mcpResource.serverName
