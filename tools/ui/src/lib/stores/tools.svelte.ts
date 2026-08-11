@@ -15,7 +15,7 @@ import {
 } from '$lib/enums';
 import { ToolsService } from '$lib/services/tools.service';
 import { mcpStore } from '$lib/stores/mcp.svelte';
-import { config } from '$lib/stores/settings.svelte';
+import { settingsStore } from '$lib/stores/settings.svelte';
 import type { OpenAIToolDefinition, ToolEntry, ToolGroup } from '$lib/types';
 import { buildSandboxToolDefinition } from '$lib/utils';
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
@@ -172,13 +172,13 @@ class ToolsStore {
 	}
 
 	get frontendTools(): OpenAIToolDefinition[] {
-		return config().jsSandboxEnabled
-			? [buildSandboxToolDefinition(!!config().symbolicMathEnabled)]
+		return settingsStore.config.jsSandboxEnabled
+			? [buildSandboxToolDefinition(!!settingsStore.config.symbolicMathEnabled)]
 			: [];
 	}
 
 	get customTools(): OpenAIToolDefinition[] {
-		const raw = config().customJson;
+		const raw = settingsStore.config.customJson;
 
 		if (!raw || typeof raw !== 'string') return [];
 
