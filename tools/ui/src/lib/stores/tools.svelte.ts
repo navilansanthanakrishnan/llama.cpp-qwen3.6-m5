@@ -593,7 +593,3 @@ class ToolsStore {
 }
 
 export const toolsStore = new ToolsStore();
-
-export const allTools = () => toolsStore.allTools;
-export const allToolDefinitions = () => toolsStore.allToolDefinitions;
-export const toolGroups = () => toolsStore.toolGroups;
