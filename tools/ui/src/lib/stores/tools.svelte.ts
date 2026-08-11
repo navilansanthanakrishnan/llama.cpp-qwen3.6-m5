@@ -1,5 +1,4 @@
 import {
-	buildSandboxToolDefinition,
 	DISABLED_TOOL_KEYS_LOCALSTORAGE_KEY,
 	HOME_TILDE,
 	TOOL_GROUP_LABELS,
@@ -17,6 +16,7 @@ import { ToolsService } from '$lib/services/tools.service';
 import { mcpStore } from '$lib/stores/mcp.svelte';
 import { config } from '$lib/stores/settings.svelte';
 import type { OpenAIToolDefinition, ToolEntry, ToolGroup } from '$lib/types';
+import { buildSandboxToolDefinition } from '$lib/utils';
 import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 
 /** Stable selection identity for a tool, shared by the disabled set and the permission store */
