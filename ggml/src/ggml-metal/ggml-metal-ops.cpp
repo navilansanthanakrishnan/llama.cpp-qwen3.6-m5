@@ -2291,6 +2291,27 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// True when the narrow-N mat-mat tile should handle this shape: K-quant weights
+// at a speculative verify width. Upstream would send these to the small-batch
+// mat-vec, which never reaches the matrix units, or to a 128-wide mat-mat tile
+// that discards 96% of its arithmetic.
+static bool ggml_metal_use_narrow_n(const ggml_tensor * op) {
+    static const bool off = getenv("GGML_METAL_NO_NARROW_N") != nullptr;
+    if (off) {
+        return false;
+    }
+    const int64_t ne11 = op->src[1]->ne[1];
+    const int64_t ne00 = op->src[0]->ne[0];
+    const ggml_type t0 = op->src[0]->type;
+    if (op->src[1]->type != GGML_TYPE_F32 || ne00 < 64) {
+        return false;
+    }
+    if (ne11 < 2 || ne11 > 16) {
+        return false;
+    }
+    return t0 == GGML_TYPE_Q4_K || t0 == GGML_TYPE_Q5_K || t0 == GGML_TYPE_Q6_K;
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2328,7 +2349,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     // find the break-even point where the matrix-matrix kernel becomes more efficient compared
     // to the matrix-vector kernel
-    const int ne11_mm_min = 8;
+    const int ne11_mm_min = ggml_metal_use_narrow_n(op) ? 1 : 8;
 
     // Register-resident Q4_K mat-vec on the simdgroup matrix units. At these
     // widths mul_mv_ext is scalar and mul_mm pays for threadgroup staging, so
@@ -2394,7 +2415,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
-    if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
+    if (!ggml_metal_use_narrow_n(op) &&
+        op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
         (
          (
           (
