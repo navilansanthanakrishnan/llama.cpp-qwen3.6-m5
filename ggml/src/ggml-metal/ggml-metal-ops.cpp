@@ -2336,9 +2336,12 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // into simdgroup matrix registers. Opt out with GGML_METAL_SGMV_DISABLE=1,
     // which is what makes an A/B possible on a single binary.
     static const bool sgq4k_disable = getenv("GGML_METAL_SGMV_DISABLE") != nullptr;
+    // per-type opt-out, so each type's contribution can be A/B'd on its own
+    static const bool sgq5k_disable = getenv("GGML_METAL_SGMV_NO_Q5K") != nullptr;
 
     if (!sgq4k_disable &&
         (op->src[0]->type == GGML_TYPE_Q4_K ||
+         (op->src[0]->type == GGML_TYPE_Q5_K && !sgq5k_disable) ||
          op->src[0]->type == GGML_TYPE_Q6_K) &&
         op->src[1]->type == GGML_TYPE_F32  &&
         // >=4 only: the fragment is 8 wide, so narrow widths pay for columns

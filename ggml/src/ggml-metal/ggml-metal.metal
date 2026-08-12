@@ -11842,3 +11842,119 @@ kernel void kernel_mul_mv_sgq6k_f32(
         if (vc1) d0[(uint64_t)(lcol+1)*args.ne0 + i01] = e[1];
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Register-resident Q5_K mat-vec. Same design again; Q5_K carries ssm_out in
+// all 48 gated-delta-net layers, 6.1% of this model's weight bytes.
+//
+// The qs and scales layout is identical to Q4_K, plus a one-bit-per-element
+// plane in qh supplying the fifth bit: qh[l] bit 2g for the low-nibble
+// sub-block of group g, bit 2g+1 for the high one. qh is indexed by element
+// alone, so it loads once per super-block while only the bit position moves.
+// block_q5_K is 176 bytes and therefore 8-byte aligned, so unlike Q6_K the
+// quant planes take direct uint2 loads.
+// ---------------------------------------------------------------------------
+kernel void kernel_mul_mv_sgq5k_f32(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const uint lrow = 4*(tiisg/16) + ((tiisg%8)/2);
+    const uint lcol = 4*((tiisg%16)/8) + 2*(tiisg%2);
+
+    const int i01 = tgpig.x*(8*NSG) + 8*sgitg + (int) lrow;
+    const int i1m = tgpig.z;
+    const int i12 = i1m%FC_mul_mv_ne12;
+    const int i13 = i1m/FC_mul_mv_ne12;
+
+    const bool vrow = i01 < args.ne01;
+
+    const uint64_t offset0 = (uint64_t)(vrow ? i01 : 0)*args.nb01
+                           + (i12/FC_mul_mv_r2)*args.nb02
+                           + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 = i12*args.nb12 + i13*args.nb13;
+
+    device const block_q5_K * x = (device const block_q5_K *) (src0 + offset0);
+    device const char       * y = src1 + offset1;
+
+    const int nc = args.ne11;   // 2..8 columns; lanes past it compute garbage we drop
+    const bool vc0 = (int) lcol     < nc;
+    const bool vc1 = (int)(lcol+1) < nc;
+
+    device const float * yc0 = (device const float *)(y + (vc0 ? lcol     : 0)*args.nb11);
+    device const float * yc1 = (device const float *)(y + (vc1 ? (lcol+1) : 0)*args.nb11);
+
+    const int nb = args.ne00/QK_K;
+
+    simdgroup_float8x8 acc;
+    { thread auto & e = acc.thread_elements(); e[0] = 0.0f; e[1] = 0.0f; }
+
+    for (int ib = 0; ib < nb; ++ib) {
+        device const block_q5_K * xb = x + ib;
+        const float dd = (float) xb->d * 255.0f;   // 255 undoes the unorm divisor
+        const float dm = (float) xb->dmin;
+
+        // qh is indexed by element only, not by sub-block, so one load per
+        // super-block serves all four groups -- only the bit position moves.
+        const uint2 qhx = *((device const uint2 *)(xb->qh + lcol*4));
+
+        for (uint g = 0; g < 4; ++g) {
+            const uint jlo = ib*QK_K + (2*g  )*32 + lrow*4;
+            const uint jhi = ib*QK_K + (2*g+1)*32 + lrow*4;
+
+            const float4 bl0 = *((device const float4 *)(yc0 + jlo));
+            const float4 bl1 = *((device const float4 *)(yc1 + jlo));
+            const float4 bh0 = *((device const float4 *)(yc0 + jhi));
+            const float4 bh1 = *((device const float4 *)(yc1 + jhi));
+
+            const uint2 qv = *((device const uint2 *)(xb->qs + g*32 + lcol*4));
+
+            // Fifth bit: qh is indexed by element within the 32-run only, so the
+            // same bytes serve every group and only the bit position moves --
+            // bit 2g for the low-nibble sub-block, 2g+1 for the high one.
+            const uint2 qh = *((device const uint2 *)(xb->qh + lcol*4));
+            const uint hl0 = ((qh.x >> (2*g    )) & 0x01010101u) << 4;
+            const uint hl1 = ((qh.y >> (2*g    )) & 0x01010101u) << 4;
+            const uint hh0 = ((qh.x >> (2*g + 1)) & 0x01010101u) << 4;
+            const uint hh1 = ((qh.y >> (2*g + 1)) & 0x01010101u) << 4;
+
+            uchar scl, mml, sch, mmh;
+            sgq4k_scale_min((int)(2*g  ), xb->scales, scl, mml);
+            sgq4k_scale_min((int)(2*g+1), xb->scales, sch, mmh);
+
+            const float dl = dd*(float) scl, ml = dm*(float) mml;
+            const float dh = dd*(float) sch, mh = dm*(float) mmh;
+
+            const float4 al0 = fma(unpack_unorm4x8_to_float((qv.x & 0x0F0F0F0Fu) | hl0), dl, -ml);
+            const float4 al1 = fma(unpack_unorm4x8_to_float((qv.y & 0x0F0F0F0Fu) | hl1), dl, -ml);
+            const float4 ah0 = fma(unpack_unorm4x8_to_float(((qv.x >> 4) & 0x0F0F0F0Fu) | hh0), dh, -mh);
+            const float4 ah1 = fma(unpack_unorm4x8_to_float(((qv.y >> 4) & 0x0F0F0F0Fu) | hh1), dh, -mh);
+
+            FOR_UNROLL (uint t = 0; t < 4; ++t) {
+                simdgroup_float8x8 a, b;
+                { thread auto & e = b.thread_elements(); e[0] = bl0[t]; e[1] = bl1[t]; }
+                { thread auto & e = a.thread_elements(); e[0] = al0[t]; e[1] = al1[t]; }
+                simdgroup_multiply_accumulate(acc, a, b, acc);
+                { thread auto & e = b.thread_elements(); e[0] = bh0[t]; e[1] = bh1[t]; }
+                { thread auto & e = a.thread_elements(); e[0] = ah0[t]; e[1] = ah1[t]; }
+                simdgroup_multiply_accumulate(acc, a, b, acc);
+            }
+        }
+    }
+
+    if (vrow) {
+        thread auto & e = acc.thread_elements();
+        device float * d0 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1;
+        if (vc0) d0[(uint64_t)(lcol  )*args.ne0 + i01] = e[0];
+        if (vc1) d0[(uint64_t)(lcol+1)*args.ne0 + i01] = e[1];
+    }
+}
+
+
+
