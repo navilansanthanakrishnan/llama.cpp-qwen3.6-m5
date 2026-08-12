@@ -1,61 +1,9 @@
-> ### This is a fork. What's different
->
-> A Metal path that dequantizes K-quantized weights **directly into simdgroup
-> matrix-unit registers**, with no threadgroup staging, on an Apple M5 Pro
-> (16 GPU cores, 24 GiB). Upstream has no kernel that does this: `mul_mv` and
-> `mul_mv_ext` are register-resident but scalar, and `mul_mm` reaches the
-> matrix units only by staging dequantized weights through threadgroup memory,
-> which is why it costs about the same as mat-vec at the batch widths
-> speculative decoding actually uses.
->
-> Two things make it possible, both measured rather than assumed:
->
-> 1. `simdgroup_matrix::thread_elements()` is **writable**, so dequantized
->    weights can be placed straight into the matrix registers. Its
->    lane&rarr;element layout is implementation-defined, so it was recovered
->    empirically:
->    `row = 4*(lane/16) + (lane%8)/2`, `col = 4*((lane%16)/8) + 2*(lane%2)`.
-> 2. The sum over K is **order-invariant**, so the map from fragment column to
->    element within a quant block is free to choose. Picking `elem = k*4 + t`
->    turns each lane's eight weights into a single aligned 8-byte load.
->
-> **Kernels:** `kernel_mul_mv_sgq4k_f32`, `..._sgq5k_f32`, `..._sgq6k_f32` in
-> `ggml/src/ggml-metal/ggml-metal.metal`, used for Q4_K/Q5_K/Q6_K &times; F32 at
-> batch widths 4&ndash;8. Together those types are **99.1%** of this model's
-> weight bytes. Width 1 and large batches are untouched, and
-> `GGML_METAL_SGMV_DISABLE=1` restores the previous path so an A/B runs on a
-> single binary.
->
-> **Measured** on Qwen3.6-27B-Q4_K_M, context 4096, quantization unchanged:
->
-> | | before | after |
-> |---|---|---|
-> | width-8 verify (`llama-bench -p 8 -n 0`) | 215.2 ms | **110.4 ms** |
-> | Q4_K mat-vec, m=4096 k=14336, n=8 | 510 &micro;s | **235 &micro;s** |
-> | decode, MTP speculative | 14.57 tok/s | **23.76 tok/s** |
->
-> Per-shape cost is now **flat in batch width** (233&ndash;235 &micro;s from n=2 to
-> n=8, where the previous path climbed 163 &rarr; 510 &micro;s), so verification
-> cost no longer grows with speculative draft depth.
->
-> **Output is unchanged.** Greedy generation is token-exact against the
-> pre-change references on all 14 test prompts, and wikitext-2 perplexity is
-> 5.9079 against a frozen 5.9079. `test-backend-ops` passes for all three
-> types, including broadcast, permuted, and partial-threadgroup shapes.
->
-> Also here: a `dequantize_q4_K` fix (the second-half super-block scale was
-> divided in half precision, which is subnormal for 99.9998% of this model's
-> super-blocks), three fixes that make MTP speculative decoding fit in memory
-> at all, a union draft extension that appends lookup tokens to the model's
-> draft rather than substituting them, and added `test-backend-ops` coverage
-> for K-quant mat-vec row gates and partial tiles.
->
-> Every performance number above comes from an interleaved ABBA A/B on a single
-> binary, six pairs, an exact sign-flip permutation test, under an exclusive
-> measurement lock, with a 3.0% minimum detectable effect established by a null
-> test and a positive control.
->
-> Upstream README follows.
+> **Fork note.** Adds a Metal path for Apple Silicon that dequantizes K-quantized
+> weights directly into simdgroup matrix-unit registers, avoiding threadgroup
+> staging, for Q4_K/Q5_K/Q6_K at batch widths 4–8. On an M5 Pro running
+> Qwen3.6-27B-Q4_K_M this reduces width-8 verification from 215 ms to 110 ms and
+> raises speculative decode from 14.6 to 23.8 tok/s, with token-exact output.
+> Set `GGML_METAL_SGMV_DISABLE=1` to fall back to the upstream path.
 
 # llama.cpp
 
