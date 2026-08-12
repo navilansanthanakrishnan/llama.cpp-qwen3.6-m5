@@ -10757,6 +10757,24 @@ kernel void kernel_mul_mm_id(
 // matrix-matrix multiplication
 //
 
+// Sum the per-split partial products of a split-K matmul.
+// dst[i] = sum_{s<nsplit} partial[s*stride + i]
+kernel void kernel_mul_mm_reduce_f32(
+        device const float * partial [[buffer(0)]],
+        device       float * dst     [[buffer(1)]],
+        constant     uint  & n       [[buffer(2)]],
+        constant     uint  & nsplit  [[buffer(3)]],
+        uint tpig[[thread_position_in_grid]]) {
+    if (tpig >= n) {
+        return;
+    }
+    float acc = 0.0f;
+    for (uint s = 0; s < nsplit; ++s) {
+        acc += partial[(size_t) s * n + tpig];
+    }
+    dst[tpig] = acc;
+}
+
 typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
 
 template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;

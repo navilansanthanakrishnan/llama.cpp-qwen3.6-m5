@@ -31,6 +31,8 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 //
 
 // tokens per expert
+int    ggml_metal_op_mul_mat_splitk_n (const struct ggml_tensor * op);
+size_t ggml_metal_op_mul_mat_extra_splitk(const struct ggml_tensor * op);
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const struct ggml_tensor * op);
 
 // id map [n_tokens, n_expert]

@@ -2328,11 +2328,18 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     // find the break-even point where the matrix-matrix kernel becomes more efficient compared
     // to the matrix-vector kernel
-    const int ne11_mm_min = 8;
+    // Crossover from mat-vec to mat-mat. When split-K can restore mul_mm's
+    // parallelism at narrow batches, route those widths to it instead: the
+    // matrix units reach 17.6 TFLOP/s where the scalar mat-vec tops out near 4.
+    int ne11_mm_min = 8;
+    if (ggml_metal_op_mul_mat_splitk_n(op) >= 2) {
+        ne11_mm_min = 1;
+    }
 
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
     if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
+        ggml_metal_op_mul_mat_splitk_n(op) < 2 &&
         (
          (
           (
@@ -2468,21 +2475,74 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             /*.r3   =*/ r3,
         };
 
-        ggml_metal_encoder_set_pipeline(enc, pipeline);
-        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
-
         const size_t smem = pipeline.smem;
-
-        ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
         const int nr0 = pipeline.nr0;
         const int nr1 = pipeline.nr1;
         const int nsg = pipeline.nsg;
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
+        const int nsplit = ggml_metal_op_mul_mat_splitk_n(op);
+
+        if (nsplit < 2) {
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
+        } else {
+            // SPLIT-K. Each split computes a partial product over its own slice
+            // of K into its own slab of scratch appended after dst, then a
+            // reduction sums the slabs. The kernel itself is unchanged: a
+            // partial product is just a matmul with a smaller ne00 and shifted
+            // src0/src1 base pointers.
+            const int64_t kc = ne00 / nsplit;            // K per split, whole blocks
+
+            ggml_metal_buffer_id bid_scratch = ggml_metal_get_buffer_id(op);
+            bid_scratch.offs += ggml_nbytes(op);
+
+            for (int is = 0; is < nsplit; ++is) {
+                ggml_metal_kargs_mul_mm args_s = args;
+                args_s.ne00 = kc;
+
+                ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
+                ggml_metal_buffer_id bid_src1 = ggml_metal_get_buffer_id(op->src[1]);
+                ggml_metal_buffer_id bid_out  = bid_scratch;
+
+                bid_src0.offs += ggml_row_size(op->src[0]->type, is*kc);
+                bid_src1.offs += is*kc*nb10;
+                bid_out.offs  += (size_t) is * ggml_nbytes(op);
+
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+                ggml_metal_encoder_set_bytes   (enc, &args_s, sizeof(args_s), 0);
+                ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+                ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+                ggml_metal_encoder_set_buffer  (enc, bid_out,  3);
+
+                ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+
+                ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + nr1 - 1) / nr1), ((ne01 + nr0 - 1) / nr0), ne12 * ne13, 32, nsg, 1);
+            }
+
+            // the reduction reads every slab, so it must not overlap the splits
+            ggml_metal_op_concurrency_reset(ctx);
+
+            auto pipeline_red = ggml_metal_library_get_pipeline_mul_mm_reduce(lib);
+
+            uint32_t nelem = (uint32_t) (ggml_nbytes(op) / sizeof(float));
+            uint32_t ns_u  = (uint32_t) nsplit;
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline_red);
+            ggml_metal_encoder_set_buffer  (enc, bid_scratch, 0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 1);
+            ggml_metal_encoder_set_bytes   (enc, &nelem, sizeof(nelem), 2);
+            ggml_metal_encoder_set_bytes   (enc, &ns_u,  sizeof(ns_u),  3);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, (nelem + 255)/256, 1, 1, 256, 1, 1);
+        }
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op);
 
@@ -2533,6 +2593,83 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     }
 
     return 1;
+}
+
+// Split-K for the mat-mat path.
+//
+// Speculative verification presents src1 widths of 2..8. At those widths
+// mul_mm's grid is (ne01/NR0) x ceil(ne11/NR1) and the second factor is 1, so a
+// 5120-row projection launches 80 threadgroups on a 16-core GPU. Measured, the
+// kernel reaches 17.6 TFLOP/s at ne11=512 and only 3.4 at ne11=16 -- it is
+// starved of parallelism, not of arithmetic.
+//
+// Splitting the K dimension across nsplit threadgroups restores it: each
+// computes a partial product over its own K range and a reduction sums them.
+// Vulkan derives split_k from shader_core_count and CUDA uses stream-k; Metal
+// had neither.
+//
+// Returns 1 when splitting is not worthwhile.
+int ggml_metal_op_mul_mat_splitk_n(const ggml_tensor * op) {
+    static const int force = []() {
+        const char * e = getenv("GGML_METAL_SPLITK");
+        return e ? atoi(e) : -1;
+    }();
+    if (force == 0) {
+        return 1;   // disabled
+    }
+
+    const int64_t ne11 = op->src[1]->ne[1];
+    const int64_t ne00 = op->src[0]->ne[0];
+    const int64_t ne01 = op->src[0]->ne[1];
+    const int64_t ne12 = op->src[1]->ne[2];
+    const int64_t ne13 = op->src[1]->ne[3];
+
+    // only the narrow-batch regime; wide batches already fill the machine
+    if (ne11 < 2 || ne11 > 8) {
+        return 1;
+    }
+    if (op->src[1]->type != GGML_TYPE_F32) {
+        return 1;
+    }
+
+    const int64_t blck = ggml_blck_size(op->src[0]->type);
+    if (blck <= 0 || ne00 % blck != 0) {
+        return 1;
+    }
+    const int64_t nblk = ne00 / blck;    // K in whole quant blocks
+
+    // threadgroups without splitting
+    const int64_t tg = ((ne01 + 63) / 64) * ne12 * ne13;
+
+    // aim for roughly 4096 resident threadgroups, which is where the kernel was
+    // measured to reach full arithmetic throughput
+    int want = (int) ((4096 + tg - 1) / std::max<int64_t>(tg, 1));
+    if (force > 0) {
+        want = force;
+    }
+    if (want < 2) {
+        return 1;
+    }
+    if (want > 16) {
+        want = 16;
+    }
+
+    // the split must land on quant-block boundaries
+    while (want > 1 && nblk % want != 0) {
+        want--;
+    }
+    if (want < 2 || nblk / want < 2) {
+        return 1;
+    }
+    return want;
+}
+
+size_t ggml_metal_op_mul_mat_extra_splitk(const ggml_tensor * op) {
+    const int ns = ggml_metal_op_mul_mat_splitk_n(op);
+    if (ns < 2) {
+        return 0;
+    }
+    return (size_t) ns * ggml_nbytes(op);
 }
 
 size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
