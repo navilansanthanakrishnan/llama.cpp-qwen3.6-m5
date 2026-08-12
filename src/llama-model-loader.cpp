@@ -1387,6 +1387,44 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     }
 }
 
+std::vector<std::pair<size_t, size_t>> llama_model_loader::get_mapping_ranges(void ** addr, int idx, ggml_context * ctx, size_t max_gap) const {
+    GGML_ASSERT(!mappings.empty());
+    const auto & mapping = mappings.at(idx);
+    *addr = mapping->addr();
+
+    std::vector<std::pair<size_t, size_t>> iv;
+    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+        const auto * weight = get_weight(ggml_get_name(tensor));
+        if (!weight || weight->idx != idx) {
+            continue;
+        }
+        iv.emplace_back(weight->offs, weight->offs + ggml_nbytes(tensor));
+    }
+    if (iv.empty()) {
+        return {};
+    }
+
+    std::sort(iv.begin(), iv.end());
+
+    // Merge, splitting only on gaps worth their own buffer. A model file
+    // interleaves tensors that land on different backends: on Metal with this
+    // 27B, token_embd is tensor #2 of 866 by offset and is assigned to the CPU,
+    // so a single min..max span wires its 682 MiB into the device buffer for
+    // nothing. Small gaps are alignment padding and must NOT be split, or every
+    // tensor gets its own buffer.
+    std::vector<std::pair<size_t, size_t>> out;
+    out.push_back(iv[0]);
+    for (size_t i = 1; i < iv.size(); ++i) {
+        auto & back = out.back();
+        if (iv[i].first <= back.second + max_gap) {
+            back.second = std::max(back.second, iv[i].second);
+        } else {
+            out.push_back(iv[i]);
+        }
+    }
+    return out;
+}
+
 void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     const auto & w = require_weight(ggml_get_name(cur));
 
@@ -1450,7 +1488,8 @@ bool llama_model_loader::load_all_data(
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
         // First determine if the backend supports the necessary features for async uploads.
-        auto * buf = bufs.count(0) ? bufs.at(0) : nullptr;
+        auto it0 = bufs.find(0);
+        auto * buf = it0 != bufs.end() ? it0->second : nullptr;
         if (!buf) {
             LLAMA_LOG_DEBUG("%s: no buffer found for async uploads\n", func);
             return nullptr;
@@ -1521,7 +1560,7 @@ bool llama_model_loader::load_all_data(
     if (upload_backend) {
         LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
-            ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.at(0))),
+            ggml_backend_buft_name(ggml_backend_buffer_get_type(bufs.begin()->second)),
             ggml_backend_name(upload_backend));
     }
 
@@ -1542,11 +1581,22 @@ bool llama_model_loader::load_all_data(
 
         if (use_mmap) {
             const auto & mapping = mappings.at(weight->idx);
-            ggml_backend_buffer_t buf_mmap = nullptr;
-            if (bufs.count(weight->idx)) {
-                buf_mmap = bufs.at(weight->idx);
-            }
             uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+
+            // A file may back several device buffers (holes are skipped), so
+            // pick the one whose address range actually contains this tensor.
+            ggml_backend_buffer_t buf_mmap = nullptr;
+            {
+                auto range = bufs.equal_range(weight->idx);
+                for (auto it = range.first; it != range.second; ++it) {
+                    uint8_t * base = (uint8_t *) ggml_backend_buffer_get_base(it->second);
+                    const size_t sz = ggml_backend_buffer_get_size(it->second);
+                    if (data >= base && data + n_size <= base + sz) {
+                        buf_mmap = it->second;
+                        break;
+                    }
+                }
+            }
 
             if (check_tensors) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {

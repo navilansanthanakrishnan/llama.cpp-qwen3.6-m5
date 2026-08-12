@@ -15,7 +15,9 @@
 #include <stdexcept>
 #include <unordered_map>
 
-using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
+// multimap: one mmap'd file can back SEVERAL device buffers when tensors
+// assigned elsewhere (e.g. token_embd on the CPU) leave holes in its span.
+using llama_buf_map = std::unordered_multimap<uint32_t, ggml_backend_buffer_t>;
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
@@ -193,6 +195,9 @@ struct llama_model_loader {
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
+    // Maximal contiguous byte runs of `idx` actually occupied by tensors in
+    // `ctx`, merging gaps below `max_gap`. Runs are returned in offset order.
+    std::vector<std::pair<size_t, size_t>> get_mapping_ranges(void ** addr, int idx, ggml_context * ctx, size_t max_gap) const;
 
     // for backwards compatibility, does not support ggml-backend
     void load_data_for(struct ggml_tensor * cur) const;

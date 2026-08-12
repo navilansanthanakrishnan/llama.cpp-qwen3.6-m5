@@ -1147,6 +1147,17 @@ private:
                     cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
                 }
                 cparams_dft.n_rs_seq = 0;
+                // Mirror the n_ubatch clamp applied to the real MTP draft context
+                // in common_speculative_init_result. Without this the fitter still
+                // reserves ~136 MiB of the target's budget for a context that will
+                // only allocate ~9 MiB, and needlessly shrinks the target.
+                {
+                    const int32_t  n_max_dft = std::max(0, params.speculative.draft.n_max);
+                    const uint32_t n_ub_need = (uint32_t) std::max<int64_t>(
+                            (int64_t) std::max(1, params.n_parallel) * (1 + n_max_dft), 32);
+                    const uint32_t n_ub_tgt  = cparams_dft.n_ubatch ? cparams_dft.n_ubatch : cparams_dft.n_batch;
+                    cparams_dft.n_ubatch = std::min(n_ub_tgt, n_ub_need);
+                }
 
                 std::vector<ggml_backend_dev_t> devs;
                 uint32_t hp_ngl = 0;
