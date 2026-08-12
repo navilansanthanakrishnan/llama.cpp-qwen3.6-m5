@@ -7,6 +7,10 @@ bandwidth measured with a frozen probe.
 
 Context is 4096 throughout. The quantization is never changed.
 
+The measurement harness, the ledger of every change tried and rejected, and the
+standalone Metal probes are in the research repo:
+**[qwen36-metal-research](https://github.com/navilansanthanakrishnan/qwen36-metal-research)**.
+
 ## Result
 
 | | before | after |
@@ -99,10 +103,47 @@ Runs are discarded above 25000 swap pages or 5% relative standard deviation.
 The environment gate refuses to benchmark on battery, under Spotlight indexing,
 above a load average of 3.0, or with another process over 50% CPU.
 
+## Reproducing
+
+```bash
+git clone https://github.com/navilansanthanakrishnan/llama.cpp-qwen3.6-m5 llama.cpp
+cd llama.cpp && git checkout sgmv-q4k
+cmake -B build -DGGML_METAL=ON && cmake --build build -j
+```
+
+Run decode with the configuration these numbers were taken at:
+
+```bash
+LLAMA_ARG_SPEC_N_RS_SEQ=3 LLAMA_ARG_SPEC_MTP_MAX=4 LLAMA_ARG_SPEC_EXT_N=3 \
+build/bin/llama-server -m Qwen3.6-27B-Q4_K_M.gguf \
+  -ngl 99 -fa on -ctk f16 -ctv f16 -c 4096 -b 512 -ub 512 -np 1 \
+  --spec-type draft-mtp --spec-draft-n-max 7 --spec-draft-n-min 0 -ctxcp 0 -cram 0
+```
+
+`-b` must equal the ubatch and `-ctxcp 0 -cram 0` are required: without them the
+server reserves up to 32 context checkpoints at 149.6 MiB each plus an 8 GiB
+prompt cache and dies on a 24 GiB machine.
+
+`GGML_METAL_SGMV_DISABLE=1` selects the previous path, so both arms of a
+comparison run on one binary. `GGML_METAL_SGMV_NO_Q5K=1` isolates the Q5_K
+kernel alone.
+
+Per-shape kernel timings, no model needed:
+
+```bash
+build/bin/test-backend-ops perf -o MUL_MAT -p "type_a=q4_K,type_b=f32,m=4096"
+build/bin/test-backend-ops test -o MUL_MAT -p "type_a=q4_K"   # correctness
+```
+
+The A/B harness, the environment gate, and the standalone kernel probe are in
+the [research repo](https://github.com/navilansanthanakrishnan/qwen36-metal-research).
+
 ## Branches
 
 `sgmv-q4k` is the tuned stack and the default branch. `trunk` is the upstream
-commit it forks from. Other branches hold experiments that were measured and
-**rejected** — split-K `mul_mm` (−57%), a narrow-N `mul_mm` tile (−23%), a
+commit it forks from. `frspec-test` carries a frequency-ranked draft vocabulary
+ported from prior work on an M4 Max: its mechanism works — the decode cycle drops
+from ~160 ms to 112 ms — but it loses on acceptance here and is deliberately not
+merged. Other branches hold experiments that were measured and **rejected** — split-K `mul_mm` (−57%), a narrow-N `mul_mm` tile (−23%), a
 multi-column K-quant mat-vec, and a device-to-host memcpy fast path (noise) —
 kept as the record of what was tried.

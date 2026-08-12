@@ -6,8 +6,10 @@
 > upstreaming on their own: a `dequantize_q4_K` scale that goes subnormal for
 > 99.9998% of blocks on every Q4_K model, and `test-backend-ops` coverage that
 > caught two wrong kernels before either was timed. Details:
-> **[QWEN36-M5.md](QWEN36-M5.md)**. Branch `sgmv-q4k` is the tuned stack; `trunk` is
-> the upstream commit it forks from.
+> **[QWEN36-M5.md](QWEN36-M5.md)**; the harness, the ledger of everything tried and
+> rejected, and the kernel probes are in
+> **[qwen36-metal-research](https://github.com/navilansanthanakrishnan/qwen36-metal-research)**. Branch
+> `sgmv-q4k` is the tuned stack; `trunk` is the upstream commit it forks from.
 
 # llama.cpp
 
