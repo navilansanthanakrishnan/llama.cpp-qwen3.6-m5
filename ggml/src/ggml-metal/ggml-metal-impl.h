@@ -54,6 +54,13 @@
 #define N_R0_Q4_K 2
 #define N_SG_Q4_K 2
 
+// Row tile for the MULTI-COLUMN Q4_K mat-vec. Separate from N_R0_Q4_K because
+// the nr1 activation arrays (nr1 * 32 floats) eat the register budget the
+// single-column tile was chosen against. Verify with the per-pipeline
+// maxTotalThreadsPerThreadgroup logged at GGML_LOG_DEBUG: if it falls below the
+// single-column kernel's value, this variant spilled.
+#define N_R0_Q4_K_R1 2
+
 #define N_R0_Q5_K 1
 #define N_SG_Q5_K 2
 

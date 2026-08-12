@@ -798,6 +798,25 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
+// Number of src1 columns the multi-column Q4_K mat-vec should take; 1 means use
+// the ordinary single-column kernel.
+//
+// GGML_METAL_NO_Q4K_MULTICOL=1 disables it, so both arms of an A/B live in one
+// binary and no rebuild sits between them.
+static int ggml_metal_q4k_multicol_cols(int ne11) {
+    static int off = -1;
+    if (off < 0) {
+        off = getenv("GGML_METAL_NO_Q4K_MULTICOL") ? 1 : 0;
+    }
+    if (off) {
+        return 1;
+    }
+    if (ne11 >= 2 && ne11 <= 4) {
+        return ne11;
+    }
+    return 1;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -891,6 +910,25 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
+
+                // Multi-column variant: one threadgroup handles nr1 columns of
+                // src1, so the weight read and the 6-bit scale decode are paid
+                // once instead of once per column. Speculative verification
+                // presents exactly ne11 = 2..4 at draft depths 1..3, and decode
+                // is ~94% memory bound, so this is the whole cost of verifying.
+                //
+                // Bounded at 4 because the activation arrays are nr1*32 floats;
+                // past that the kernel spills and the amortisation is paid back
+                // with interest. Check maxTotalThreadsPerThreadgroup per
+                // pipeline (GGML_LOG_DEBUG) before raising it.
+                {
+                    const int c = ggml_metal_q4k_multicol_cols(ne11);
+                    if (c >= 2) {
+                        nr0    = N_R0_Q4_K_R1;
+                        nr1    = c;
+                        suffix = c == 2 ? "_c2" : (c == 3 ? "_c3" : "_c4");
+                    }
+                }
             } break;
         case GGML_TYPE_Q5_K:
             {

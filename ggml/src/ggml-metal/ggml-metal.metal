@@ -8374,7 +8374,19 @@ kernel void kernel_mul_mv_q3_K_f32(
     kernel_mul_mv_q3_K_f32_impl<N_R0_Q3_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
-template<int nr0, typename args_t>
+// nr1 = number of src1 columns handled by one threadgroup.
+//
+// The plain mat-vec puts ne11 on grid.y with one column per threadgroup, so a
+// verify pass of width W streams the whole weight matrix W times. Decode on
+// this model is ~94% memory bound, so that multiplication is the entire cost of
+// speculative verification. Holding nr1 columns in one threadgroup pays the
+// weight read and the 6-bit scale decode ONCE and amortises both across them.
+//
+// Register pressure sets the shape: nr1 * 32 floats of live activation plus
+// nr0*nr1 accumulators. Measure maxTotalThreadsPerThreadgroup per compiled
+// pipeline (logged at GGML_LOG_DEBUG) before trusting any (nr0, nr1) pair --
+// a drop there means the variant spilled and the win is already gone.
+template<int nr0, int nr1, typename args_t>
 void kernel_mul_mv_q4_K_f32_impl(
         args_t args,
         device const char * src0,
@@ -8406,30 +8418,49 @@ void kernel_mul_mv_q4_K_f32_impl(
     const uint i12 = im%FC_mul_mv_ne12;
     const uint i13 = im/FC_mul_mv_ne12;
 
+    // r1 is the first src1 column of this threadgroup's group of nr1.
+    const int first_col = r1 * nr1;
+
     const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
-    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+    const uint64_t offset1 = first_col*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
 
     device const block_q4_K * x = (device const block_q4_K *) (src0 + offset0);
     device const float      * y = (device const float      *) (src1 + offset1);
 
-    float yl[16];
-    float yh[16];
+    // Columns beyond ne11 are computed but never stored (see the store guard).
+    // Reading them would walk off src1, so clamp the pointer instead.
+    const short ncols = (short) min((int) nr1, args.ne11 - first_col);
 
-    float sumf[nr0]={0.f};
+    float yl[nr1][16];
+    float yh[nr1][16];
+    float4 sumy[nr1];
+
+    float sumf[nr0][nr1];
+    FOR_UNROLL (short r = 0; r < nr0; ++r) {
+        FOR_UNROLL (short c = 0; c < nr1; ++c) {
+            sumf[r][c] = 0.f;
+        }
+    }
 
     device const float * y4 = y + ix * QK_K + 64 * iq + 8 * ir;
 
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
 
-    for (int ib = ix; ib < nb; ib += 4) {
-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+    const uint64_t ystride = args.nb11/4;   // floats between src1 columns
 
-        for (short i = 0; i < 8; ++i) {
-            yl[i+0] = y4[i+  0]; sumy[0] += yl[i+0];
-            yl[i+8] = y4[i+ 32]; sumy[1] += yl[i+8];
-            yh[i+0] = y4[i+128]; sumy[2] += yh[i+0];
-            yh[i+8] = y4[i+160]; sumy[3] += yh[i+8];
+    for (int ib = ix; ib < nb; ib += 4) {
+        FOR_UNROLL (short c = 0; c < nr1; ++c) {
+            // clamp so an out-of-range column re-reads column 0 rather than
+            // reading past the end of src1
+            device const float * yc = y4 + (c < ncols ? c : 0) * ystride;
+            sumy[c] = {0.f, 0.f, 0.f, 0.f};
+            for (short i = 0; i < 8; ++i) {
+                yl[c][i+0] = yc[i+  0]; sumy[c][0] += yl[c][i+0];
+                yl[c][i+8] = yc[i+ 32]; sumy[c][1] += yl[c][i+8];
+                yh[c][i+0] = yc[i+128]; sumy[c][2] += yh[c][i+0];
+                yh[c][i+8] = yc[i+160]; sumy[c][3] += yh[c][i+8];
+            }
         }
 
         device const uint16_t * sc = (device const uint16_t *)x[ib].scales + iq;
@@ -8437,6 +8468,7 @@ void kernel_mul_mv_q4_K_f32_impl(
         device const half     * dh = &x[ib].d;
 
         for (short row = 0; row < nr0; row++) {
+            // scale decode: paid once per row for ALL nr1 columns
             sc16[0] = sc[0] & kmask1;
             sc16[1] = sc[2] & kmask1;
             sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
@@ -8444,25 +8476,30 @@ void kernel_mul_mv_q4_K_f32_impl(
 
             device const uint16_t * q2 = q1 + 32;
 
-            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
-            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+            FOR_UNROLL (short c = 0; c < nr1; ++c) {
+                float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+                float4 acc2 = {0.f, 0.f, 0.f, 0.f};
 
-            FOR_UNROLL (short i = 0; i < 4; ++i) {
-                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
-                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
-                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
-                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
-                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
-                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
-                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
-                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
+                FOR_UNROLL (short i = 0; i < 4; ++i) {
+                    // q1[i]/q2[i] are read once here and reused for every c by
+                    // the compiler: they are loop-invariant in c.
+                    acc1[0] += yl[c][2*i + 0] * (q1[i] & 0x000F);
+                    acc1[1] += yl[c][2*i + 1] * (q1[i] & 0x0F00);
+                    acc1[2] += yl[c][2*i + 8] * (q1[i] & 0x00F0);
+                    acc1[3] += yl[c][2*i + 9] * (q1[i] & 0xF000);
+                    acc2[0] += yh[c][2*i + 0] * (q2[i] & 0x000F);
+                    acc2[1] += yh[c][2*i + 1] * (q2[i] & 0x0F00);
+                    acc2[2] += yh[c][2*i + 8] * (q2[i] & 0x00F0);
+                    acc2[3] += yh[c][2*i + 9] * (q2[i] & 0xF000);
+                }
+
+                sumf[row][c] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                         (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                         (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                         (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                                dh[1] * (sumy[c][0] * sc8[2] + sumy[c][1] * sc8[3] +
+                                         sumy[c][2] * sc8[6] + sumy[c][3] * sc8[7]);
             }
-
-            sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
-                                  (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
-                                  (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
-                                  (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
-                         dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
 
             q1 += args.nb01/2;
             sc += args.nb01/2;
@@ -8472,12 +8509,18 @@ void kernel_mul_mv_q4_K_f32_impl(
         y4 += 4 * QK_K;
     }
 
-    device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
+    device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1;
 
-    for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-        float sum_all = simd_sum(sumf[row]);
-        if (tiisg == 0) {
-            dst_f32[first_row + row] = sum_all;
+    for (short c = 0; c < nr1; ++c) {
+        if (c >= ncols) {
+            continue;
+        }
+        device float * dst_col = dst_f32 + (int64_t)(first_col + c)*args.ne0;
+        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+            float sum_all = simd_sum(sumf[row][c]);
+            if (tiisg == 0) {
+                dst_col[first_row + row] = sum_all;
+            }
         }
     }
 }
@@ -8492,8 +8535,30 @@ kernel void kernel_mul_mv_q4_K_f32(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, 1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
+
+// Multi-column variants. N_R0_Q4_K_R1 is deliberately its own constant: the
+// single-column kernel's row tile is chosen against a register budget that the
+// nr1 activation arrays eat into, so the two cannot share a value.
+typedef decltype(kernel_mul_mv_q4_K_f32) kernel_mul_mv_q4_K_f32_t;
+
+template<int nr1>
+kernel void kernel_mul_mv_q4_K_f32_r1(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K_R1, nr1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+template [[host_name("kernel_mul_mv_q4_K_f32_c2")]] kernel kernel_mul_mv_q4_K_f32_t kernel_mul_mv_q4_K_f32_r1<2>;
+template [[host_name("kernel_mul_mv_q4_K_f32_c3")]] kernel kernel_mul_mv_q4_K_f32_t kernel_mul_mv_q4_K_f32_r1<3>;
+template [[host_name("kernel_mul_mv_q4_K_f32_c4")]] kernel kernel_mul_mv_q4_K_f32_t kernel_mul_mv_q4_K_f32_r1<4>;
 
 template<int nr0, typename args_t>
 void kernel_mul_mv_q5_K_f32_impl(
