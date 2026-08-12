@@ -741,7 +741,14 @@ void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & re
     q = q + (il/4) * 32 + 16 * (il&1);
     il = il & 3;
     const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
-    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    // NOTE: the division must be done in float, not half. In a K-quant `d` is a
+    // scale of scales, ~100x smaller than a first-order quant's: the median over
+    // the 14.9M Q4_K super-blocks of a 27B model is 6.19e-05. Dividing that by 16
+    // in half yields 3.87e-06, below half's smallest normal 6.10e-05, so the
+    // quotient is subnormal for 99.9998% of blocks and loses ~8 mantissa bits
+    // (median relative error 3.7e-03, p99 9.6e-03, and some blocks flush to 0).
+    // dequantize_q5_K below already writes 16.f.
+    const float d   = il < 2 ? xb->d : xb->d / 16.f;
     const float min = xb->dmin;
     const float dl = d * sc[0];
     const float ml = min * sc[1];
