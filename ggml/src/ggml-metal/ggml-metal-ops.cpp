@@ -2330,6 +2330,60 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // to the matrix-vector kernel
     const int ne11_mm_min = 8;
 
+    // Register-resident Q4_K mat-vec on the simdgroup matrix units. At these
+    // widths mul_mv_ext is scalar and mul_mm pays for threadgroup staging, so
+    // neither reaches the matrix units usefully; this one dequantizes straight
+    // into simdgroup matrix registers. Opt out with GGML_METAL_SGMV_DISABLE=1,
+    // which is what makes an A/B possible on a single binary.
+    static const bool sgq4k_disable = getenv("GGML_METAL_SGMV_DISABLE") != nullptr;
+
+    if (!sgq4k_disable &&
+        op->src[0]->type == GGML_TYPE_Q4_K &&
+        op->src[1]->type == GGML_TYPE_F32  &&
+        // >=4 only: the fragment is 8 wide, so narrow widths pay for columns
+        // they do not use. Measured against the trunk path at m=4096 k=14336:
+        // n=2 0.70x, n=3 1.05x, n=4 1.12x, n=5 1.25x, n=8 2.17x. Cost is flat
+        // in width (233-235 us for n=2..8) where trunk climbs 163->510 us.
+        ne11 >= 4 && ne11 <= 8 &&
+        ne00 % 256 == 0 &&
+        nb10 == sizeof(float) &&        // src1 contiguous along the reduction
+        nb00 == ggml_type_size(GGML_TYPE_Q4_K)) {
+        const int nsg = 4;              // 8*nsg = 32 rows per threadgroup
+
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_sgq4k(lib, op, nsg);
+
+        ggml_metal_kargs_mul_mv_ext args = {
+            /*.ne00  =*/ ne00,
+            /*.ne01  =*/ ne01,
+            /*.ne02  =*/ ne02,
+            /*.nb00  =*/ nb00,
+            /*.nb01  =*/ nb01,
+            /*.nb02  =*/ nb02,
+            /*.nb03  =*/ nb03,
+            /*.ne10  =*/ ne10,
+            /*.ne11  =*/ ne11,
+            /*.ne12  =*/ ne12,
+            /*.nb10  =*/ nb10,
+            /*.nb11  =*/ nb11,
+            /*.nb12  =*/ nb12,
+            /*.nb13  =*/ nb13,
+            /*.ne0   =*/ ne0,
+            /*.ne1   =*/ ne1,
+            /*.r2    =*/ r2,
+            /*.r3    =*/ r3,
+        };
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 8*nsg - 1)/(8*nsg), 1, ne12*ne13, 32, nsg, 1);
+
+        return 1;
+    }
+
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
     if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&

@@ -3929,6 +3929,8 @@ kernel void kernel_mul_mv_q8_0_f32(
 // mat-vec kernel processing in chunks of float4
 // chpb - chunks per quantization block
 template<short r1ptg, typename q_t, short chpb, void (*deq_t4)(device const q_t *, short, thread float4 &) >
+
+
 void kernel_mul_mv_ext_q4_f32_impl(
         constant ggml_metal_kargs_mul_mv_ext & args,
         device const char * src0,
@@ -11601,3 +11603,125 @@ kernel void kernel_dsv4_hc_post_f32(
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
+
+// ---------------------------------------------------------------------------
+// Register-resident Q4_K mat-vec on the simdgroup matrix units.
+//
+// mul_mv and mul_mv_ext are register-resident but scalar; mul_mm uses the
+// matrix units but stages dequantized A through threadgroup memory, which is
+// why it is no faster than mat-vec at these widths. This kernel dequantizes
+// Q4_K straight into a simdgroup_float8x8's per-lane registers through
+// thread_elements() and multiplies on the matrix units, with no threadgroup
+// traffic at all.
+//
+// Two things make it work.
+//
+// 1. thread_elements() is writable, and its lane->element layout on this GPU
+//    is  row = 4*(lane/16) + (lane%8)/2,  col = 4*((lane%16)/8) + 2*(lane%2),
+//    with e[0]=(row,col) and e[1]=(row,col+1). Recovered empirically; it is
+//    implementation-defined, hence the runtime check in the dispatch path.
+//
+// 2. The sum over K is order-invariant, so the map from fragment column to
+//    element within a Q4_K sub-block is free to choose. Choosing elem = k*4+t
+//    makes a lane's eight weights one aligned 8-byte load, and lets both
+//    nibble halves of that load feed two sub-blocks.
+//
+// Q4_K's -dmin*m term folds into the weights as an fma rather than a separate
+// pass, so no side buffer of sub-block sums is needed.
+// ---------------------------------------------------------------------------
+
+static inline void sgq4k_scale_min(int j, device const uchar * q,
+                                   thread uchar & d, thread uchar & m) {
+    if (j < 4) { d = q[j] & 63; m = q[j+4] & 63; }
+    else       { d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4);
+                 m = (q[j+4] >>  4) | ((q[j  ] >> 6) << 4); }
+}
+
+kernel void kernel_mul_mv_sgq4k_f32(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const uint lrow = 4*(tiisg/16) + ((tiisg%8)/2);
+    const uint lcol = 4*((tiisg%16)/8) + 2*(tiisg%2);
+
+    const int i01 = tgpig.x*(8*NSG) + 8*sgitg + (int) lrow;
+    const int i1m = tgpig.z;
+    const int i12 = i1m%FC_mul_mv_ne12;
+    const int i13 = i1m/FC_mul_mv_ne12;
+
+    const bool vrow = i01 < args.ne01;
+
+    const uint64_t offset0 = (uint64_t)(vrow ? i01 : 0)*args.nb01
+                           + (i12/FC_mul_mv_r2)*args.nb02
+                           + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 = i12*args.nb12 + i13*args.nb13;
+
+    device const block_q4_K * x = (device const block_q4_K *) (src0 + offset0);
+    device const char       * y = src1 + offset1;
+
+    const int nc = args.ne11;   // 2..8 columns; lanes past it compute garbage we drop
+    const bool vc0 = (int) lcol     < nc;
+    const bool vc1 = (int)(lcol+1) < nc;
+
+    device const float * yc0 = (device const float *)(y + (vc0 ? lcol     : 0)*args.nb11);
+    device const float * yc1 = (device const float *)(y + (vc1 ? (lcol+1) : 0)*args.nb11);
+
+    const int nb = args.ne00/QK_K;
+
+    simdgroup_float8x8 acc;
+    { thread auto & e = acc.thread_elements(); e[0] = 0.0f; e[1] = 0.0f; }
+
+    for (int ib = 0; ib < nb; ++ib) {
+        device const block_q4_K * xb = x + ib;
+        const float dd = (float) xb->d * 255.0f;   // 255 undoes the unorm divisor
+        const float dm = (float) xb->dmin;
+
+        for (uint g = 0; g < 4; ++g) {
+            const uint jlo = ib*QK_K + (2*g  )*32 + lrow*4;
+            const uint jhi = ib*QK_K + (2*g+1)*32 + lrow*4;
+
+            const float4 bl0 = *((device const float4 *)(yc0 + jlo));
+            const float4 bl1 = *((device const float4 *)(yc1 + jlo));
+            const float4 bh0 = *((device const float4 *)(yc0 + jhi));
+            const float4 bh1 = *((device const float4 *)(yc1 + jhi));
+
+            const uint2 qv = *((device const uint2 *)(xb->qs + g*32 + lcol*4));
+
+            uchar scl, mml, sch, mmh;
+            sgq4k_scale_min((int)(2*g  ), xb->scales, scl, mml);
+            sgq4k_scale_min((int)(2*g+1), xb->scales, sch, mmh);
+
+            const float dl = dd*(float) scl, ml = dm*(float) mml;
+            const float dh = dd*(float) sch, mh = dm*(float) mmh;
+
+            const float4 al0 = fma(unpack_unorm4x8_to_float(qv.x & 0x0F0F0F0Fu), dl, -ml);
+            const float4 al1 = fma(unpack_unorm4x8_to_float(qv.y & 0x0F0F0F0Fu), dl, -ml);
+            const float4 ah0 = fma(unpack_unorm4x8_to_float((qv.x >> 4) & 0x0F0F0F0Fu), dh, -mh);
+            const float4 ah1 = fma(unpack_unorm4x8_to_float((qv.y >> 4) & 0x0F0F0F0Fu), dh, -mh);
+
+            FOR_UNROLL (uint t = 0; t < 4; ++t) {
+                simdgroup_float8x8 a, b;
+                { thread auto & e = b.thread_elements(); e[0] = bl0[t]; e[1] = bl1[t]; }
+                { thread auto & e = a.thread_elements(); e[0] = al0[t]; e[1] = al1[t]; }
+                simdgroup_multiply_accumulate(acc, a, b, acc);
+                { thread auto & e = b.thread_elements(); e[0] = bh0[t]; e[1] = bh1[t]; }
+                { thread auto & e = a.thread_elements(); e[0] = ah0[t]; e[1] = ah1[t]; }
+                simdgroup_multiply_accumulate(acc, a, b, acc);
+            }
+        }
+    }
+
+    if (vrow) {
+        thread auto & e = acc.thread_elements();
+        device float * d0 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1;
+        if (vc0) d0[(uint64_t)(lcol  )*args.ne0 + i01] = e[0];
+        if (vc1) d0[(uint64_t)(lcol+1)*args.ne0 + i01] = e[1];
+    }
+}
+
