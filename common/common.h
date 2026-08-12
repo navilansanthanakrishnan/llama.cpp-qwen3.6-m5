@@ -383,10 +383,32 @@ struct common_params_speculative {
         return !draft.mparams.empty();
     }
 
+    // Rollback depth for the recurrent state, decoupled from draft depth.
+    //
+    // A rollback slot is a FULL copy of the model's recurrent state. On a hybrid
+    // SSM model that is not incidental: Qwen3.6-27B carries 48 gated-delta-net
+    // layers = 149.62 MiB per slot, so the default (one slot per draft step)
+    // charges 448.86 MiB at depth 3 -- more headroom than a 24 GiB machine has
+    // once a 16 GiB model is resident. Tying the two together is what makes MTP
+    // fail to fit at ANY depth there.
+    //
+    // n_rs_seq < n_max is legal: when a rejection needs to roll back further
+    // than the available slots, the server falls back to the checkpoint-restore
+    // path it already has (tools/server/server-context.cpp:3881-3913). That path
+    // costs a forward pass, so this is a speed/memory trade the operator should
+    // be able to make -- not a constant.
+    //
+    // -1 keeps the historical behaviour (n_rs_seq = draft.n_max).
+    int32_t n_rs_seq_override = -1;
+
     uint32_t need_n_rs_seq() const {
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
+
+        if (n_rs_seq_override >= 0) {
+            return (uint32_t) n_rs_seq_override;
+        }
 
         return needs_rs_seq ? draft.n_max : 0u;
     }
