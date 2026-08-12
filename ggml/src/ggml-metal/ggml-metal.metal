@@ -11725,3 +11725,120 @@ kernel void kernel_mul_mv_sgq4k_f32(
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Register-resident Q6_K mat-vec. Same design as kernel_mul_mv_sgq4k_f32:
+// dequantize straight into simdgroup matrix registers via thread_elements(),
+// multiply on the matrix units, no threadgroup staging.
+//
+// Q6_K carries ffn_down and the fused attn_qkv -- 26.5% of this model's weight
+// bytes against Q4_K's 66.5% -- so leaving it on the scalar path capped what
+// the Q4_K kernel could do for end-to-end decode.
+//
+// The layout is harder than Q4_K. A value is 4 low bits from ql plus 2 high
+// bits from qh, biased by -32, with an int8 scale every 16 elements, laid out
+// so that within a 128-element group the four 32-element runs take
+// (ql[l], low), (ql[l+32], low), (ql[l], high), (ql[l+32], high) and qh bits
+// 2r..2r+1. So the reduction is permuted at 16-element granularity here
+// (elem = k*2 + t) rather than 32, which still gives each lane four
+// consecutive elements and one aligned load per quant plane.
+//
+// block_q6_K is 210 bytes, which is even but not a multiple of 4, so the
+// quant planes are read as ushort pairs -- a uint load would be misaligned on
+// every odd block.
+// ---------------------------------------------------------------------------
+kernel void kernel_mul_mv_sgq6k_f32(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const uint lrow = 4*(tiisg/16) + ((tiisg%8)/2);
+    const uint lcol = 4*((tiisg%16)/8) + 2*(tiisg%2);
+
+    const int i01 = tgpig.x*(8*NSG) + 8*sgitg + (int) lrow;
+    const int i1m = tgpig.z;
+    const int i12 = i1m%FC_mul_mv_ne12;
+    const int i13 = i1m/FC_mul_mv_ne12;
+
+    const bool vrow = i01 < args.ne01;
+
+    const uint64_t offset0 = (uint64_t)(vrow ? i01 : 0)*args.nb01
+                           + (i12/FC_mul_mv_r2)*args.nb02
+                           + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 = i12*args.nb12 + i13*args.nb13;
+
+    device const block_q6_K * x = (device const block_q6_K *) (src0 + offset0);
+    device const char       * y = src1 + offset1;
+
+    const int nc = args.ne11;
+    const bool vc0 = (int) lcol     < nc;
+    const bool vc1 = (int)(lcol+1) < nc;
+
+    device const float * yc0 = (device const float *)(y + (vc0 ? lcol     : 0)*args.nb11);
+    device const float * yc1 = (device const float *)(y + (vc1 ? (lcol+1) : 0)*args.nb11);
+
+    const int nb = args.ne00/QK_K;
+
+    simdgroup_float8x8 acc;
+    { thread auto & e = acc.thread_elements(); e[0] = 0.0f; e[1] = 0.0f; }
+
+    for (int ib = 0; ib < nb; ++ib) {
+        device const block_q6_K * xb = x + ib;
+        const float d = (float) xb->d;
+
+        for (uint n = 0; n < 2; ++n) {
+            device const uchar * qlb = xb->ql     + n*64;
+            device const uchar * qhb = xb->qh     + n*32;
+            device const char  * scb = (device const char *)(xb->scales) + n*8;
+
+            for (uint h = 0; h < 2; ++h) {
+                const uint off = h*16 + lcol*2;
+
+                // 210-byte blocks are only 2-byte aligned; read ushort pairs.
+                device const ushort * pl0 = (device const ushort *)(qlb      + off);
+                device const ushort * pl1 = (device const ushort *)(qlb + 32 + off);
+                device const ushort * ph  = (device const ushort *)(qhb      + off);
+
+                const uint qlo = (uint) pl0[0] | ((uint) pl0[1] << 16);
+                const uint qhi = (uint) pl1[0] | ((uint) pl1[1] << 16);
+                const uint qhv = (uint)  ph[0] | ((uint)  ph[1] << 16);
+
+                FOR_UNROLL (uint r = 0; r < 4; ++r) {
+                    const uint qlv = (r & 1) ? qhi : qlo;
+                    const uint nib = (r >= 2) ? ((qlv >> 4) & 0x0F0F0F0Fu)
+                                              : ( qlv       & 0x0F0F0F0Fu);
+                    const uint hib = ((qhv >> (2*r)) & 0x03030303u) << 4;
+                    const uint q   = nib | hib;
+
+                    const float ds = d * (float) scb[h + 2*r];
+                    const float4 a = fma(unpack_unorm4x8_to_float(q), ds*255.0f, -32.0f*ds);
+
+                    const ulong jb = (ulong) ib*QK_K + (ulong) n*128 + (ulong) r*32
+                                   + (ulong) h*16 + (ulong) lrow*2;
+                    const float2 b0 = *((device const float2 *)(yc0 + jb));
+                    const float2 b1 = *((device const float2 *)(yc1 + jb));
+
+                    simdgroup_float8x8 ma, mb;
+                    { thread auto & e = mb.thread_elements(); e[0] = b0[0]; e[1] = b1[0]; }
+                    { thread auto & e = ma.thread_elements(); e[0] = a[0];  e[1] = a[2];  }
+                    simdgroup_multiply_accumulate(acc, ma, mb, acc);
+                    { thread auto & e = mb.thread_elements(); e[0] = b0[1]; e[1] = b1[1]; }
+                    { thread auto & e = ma.thread_elements(); e[0] = a[1];  e[1] = a[3];  }
+                    simdgroup_multiply_accumulate(acc, ma, mb, acc);
+                }
+            }
+        }
+    }
+
+    if (vrow) {
+        thread auto & e = acc.thread_elements();
+        device float * d0 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1;
+        if (vc0) d0[(uint64_t)(lcol  )*args.ne0 + i01] = e[0];
+        if (vc1) d0[(uint64_t)(lcol+1)*args.ne0 + i01] = e[1];
+    }
+}

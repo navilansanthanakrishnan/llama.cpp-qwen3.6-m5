@@ -746,7 +746,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_sgq4k(ggm
 
     GGML_ASSERT(ne12 <= INT16_MAX && r2 <= INT16_MAX && r3 <= INT16_MAX);
 
-    snprintf(base, 256, "kernel_mul_mv_sgq4k_f32");
+    snprintf(base, 256, "kernel_mul_mv_sgq%dk_f32",
+             op->src[0]->type == GGML_TYPE_Q6_K ? 6 : 4);
     snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d", base, nsg, ne12, r2, r3);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

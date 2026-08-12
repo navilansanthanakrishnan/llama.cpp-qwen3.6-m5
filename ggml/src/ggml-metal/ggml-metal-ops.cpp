@@ -2338,7 +2338,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     static const bool sgq4k_disable = getenv("GGML_METAL_SGMV_DISABLE") != nullptr;
 
     if (!sgq4k_disable &&
-        op->src[0]->type == GGML_TYPE_Q4_K &&
+        (op->src[0]->type == GGML_TYPE_Q4_K ||
+         op->src[0]->type == GGML_TYPE_Q6_K) &&
         op->src[1]->type == GGML_TYPE_F32  &&
         // >=4 only: the fragment is 8 wide, so narrow widths pay for columns
         // they do not use. Measured against the trunk path at m=4096 k=14336:
@@ -2347,7 +2348,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ne11 >= 4 && ne11 <= 8 &&
         ne00 % 256 == 0 &&
         nb10 == sizeof(float) &&        // src1 contiguous along the reduction
-        nb00 == ggml_type_size(GGML_TYPE_Q4_K)) {
+        nb00 == ggml_type_size(op->src[0]->type)) {
         const int nsg = 4;              // 8*nsg = 32 rows per threadgroup
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_sgq4k(lib, op, nsg);
