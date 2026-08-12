@@ -1335,6 +1335,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
+        // Cap the MTP chain below the configured draft width, so the remaining
+        // columns can be filled by the zero-cost union extension instead of by
+        // more model-drafted tokens. The CLI n_max still sizes every buffer and
+        // the verify ubatch; only this impl's own loop stops early.
+        if (const char * e = getenv("LLAMA_ARG_SPEC_MTP_MAX")) {
+            const int v = atoi(e);
+            if (v > 0) {
+                this->params.n_max = std::min(this->params.n_max, v);
+            }
+        }
+
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
 
@@ -2621,6 +2632,83 @@ void common_speculative_draft(common_speculative * spec) {
 
         if (dp.drafting) {
             dp.drafting = false;
+        }
+    }
+
+    // Union draft extension (LLAMA_ARG_SPEC_EXT_N).
+    //
+    // The impls above are ALTERNATIVES: the first one to produce a draft sets
+    // dp.drafting = false and the rest are skipped. That is the right policy
+    // when verifying a wider draft costs proportionally more -- but on a
+    // backend where verify cost is flat in width, it throws away free tokens.
+    // Measured here: widening the verify from 5 to 8 columns costs 10.4 ms,
+    // while producing one more model-drafted token costs 9.9 ms. A token that
+    // costs nothing to produce is therefore worth appending even at fairly low
+    // acceptance.
+    //
+    // So rather than offering a lookup draft INSTEAD of the model's, append it
+    // AFTER. The result stays a single linear chain, so it needs no tree
+    // attention and no change to verification.
+    //
+    // This cannot affect output. Every appended token is verified by the target
+    // exactly like a model-drafted one and is discarded on mismatch; the tokens
+    // actually emitted are unchanged. It trades verify width for acceptance.
+    {
+        static const int n_ext = getenv("LLAMA_ARG_SPEC_EXT_N")
+                               ? atoi(getenv("LLAMA_ARG_SPEC_EXT_N")) : 0;
+        static const int n_gram = getenv("LLAMA_ARG_SPEC_EXT_NGRAM")
+                               ? atoi(getenv("LLAMA_ARG_SPEC_EXT_NGRAM")) : 3;
+
+        if (n_ext > 0) {
+            for (auto & dp : dparams) {
+                if (dp.result == nullptr || dp.prompt == nullptr) {
+                    continue;
+                }
+
+                auto & result = *dp.result;
+                const llama_tokens & hist = *dp.prompt;
+
+                if (result.empty() || (int) hist.size() <= n_gram) {
+                    continue;
+                }
+
+                // the sequence as the target will see it: history, last confirmed
+                // token, then the draft so far
+                llama_tokens cur;
+                cur.reserve(n_gram + result.size() + 1);
+                const size_t n_tail = std::min<size_t>(hist.size(), (size_t) n_gram);
+                cur.insert(cur.end(), hist.end() - n_tail, hist.end());
+                cur.push_back(dp.id_last);
+                cur.insert(cur.end(), result.begin(), result.end());
+
+                if ((int) cur.size() < n_gram) {
+                    continue;
+                }
+
+                // most recent earlier occurrence of the current n-gram
+                int at = -1;
+                for (int i = (int) hist.size() - n_gram - 1; i >= 0; --i) {
+                    bool match = true;
+                    for (int j = 0; j < n_gram; ++j) {
+                        if (hist[i + j] != cur[cur.size() - n_gram + j]) {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (match) {
+                        at = i + n_gram;
+                        break;
+                    }
+                }
+
+                if (at < 0) {
+                    continue;
+                }
+
+                for (int k = 0; k < n_ext && at + k < (int) hist.size(); ++k) {
+                    result.push_back(hist[at + k]);
+                }
+            }
         }
     }
 }
