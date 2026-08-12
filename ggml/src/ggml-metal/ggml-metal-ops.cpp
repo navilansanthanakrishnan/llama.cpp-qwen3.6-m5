@@ -2383,7 +2383,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + 8*nsg - 1)/(8*nsg), 1, ne12*ne13, 32, nsg, 1);
+        // Q4_K covers 16 rows per simdgroup (two fragments sharing one set of B
+        // loads); Q5_K and Q6_K still cover 8.
+        const int rows_sg = (op->src[0]->type == GGML_TYPE_Q4_K) ? 16 : 8;
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + rows_sg*nsg - 1)/(rows_sg*nsg), 1, ne12*ne13, 32, nsg, 1);
 
         return 1;
     }

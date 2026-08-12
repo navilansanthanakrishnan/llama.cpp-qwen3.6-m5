@@ -11650,19 +11650,22 @@ kernel void kernel_mul_mv_sgq4k_f32(
     const uint lrow = 4*(tiisg/16) + ((tiisg%8)/2);
     const uint lcol = 4*((tiisg%16)/8) + 2*(tiisg%2);
 
-    const int i01 = tgpig.x*(8*NSG) + 8*sgitg + (int) lrow;
+    const int i01 = tgpig.x*(16*NSG) + 16*sgitg + (int) lrow;   // fragment 0
+    const int i02 = i01 + 8;                                    // fragment 1
     const int i1m = tgpig.z;
     const int i12 = i1m%FC_mul_mv_ne12;
     const int i13 = i1m/FC_mul_mv_ne12;
 
     const bool vrow = i01 < args.ne01;
+    const bool vrow2 = i02 < args.ne01;
 
-    const uint64_t offset0 = (uint64_t)(vrow ? i01 : 0)*args.nb01
-                           + (i12/FC_mul_mv_r2)*args.nb02
-                           + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offbat = (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset0 = (uint64_t)(vrow  ? i01 : 0)*args.nb01 + offbat;
+    const uint64_t offset2 = (uint64_t)(vrow2 ? i02 : 0)*args.nb01 + offbat;
     const uint64_t offset1 = i12*args.nb12 + i13*args.nb13;
 
-    device const block_q4_K * x = (device const block_q4_K *) (src0 + offset0);
+    device const block_q4_K * x  = (device const block_q4_K *) (src0 + offset0);
+    device const block_q4_K * x2 = (device const block_q4_K *) (src0 + offset2);
     device const char       * y = src1 + offset1;
 
     const int nc = args.ne11;   // 2..8 columns; lanes past it compute garbage we drop
@@ -11674,13 +11677,17 @@ kernel void kernel_mul_mv_sgq4k_f32(
 
     const int nb = args.ne00/QK_K;
 
-    simdgroup_float8x8 acc;
-    { thread auto & e = acc.thread_elements(); e[0] = 0.0f; e[1] = 0.0f; }
+    simdgroup_float8x8 acc, acc2;
+    { thread auto & e = acc.thread_elements();  e[0] = 0.0f; e[1] = 0.0f; }
+    { thread auto & e = acc2.thread_elements(); e[0] = 0.0f; e[1] = 0.0f; }
 
     for (int ib = 0; ib < nb; ++ib) {
-        device const block_q4_K * xb = x + ib;
-        const float dd = (float) xb->d * 255.0f;   // 255 undoes the unorm divisor
-        const float dm = (float) xb->dmin;
+        device const block_q4_K * xb  = x  + ib;
+        device const block_q4_K * xb2 = x2 + ib;
+        const float dd  = (float) xb->d * 255.0f;   // 255 undoes the unorm divisor
+        const float dm  = (float) xb->dmin;
+        const float dd2 = (float) xb2->d * 255.0f;
+        const float dm2 = (float) xb2->dmin;
 
         for (uint g = 0; g < 4; ++g) {
             const uint jlo = ib*QK_K + (2*g  )*32 + lrow*4;
@@ -11691,37 +11698,55 @@ kernel void kernel_mul_mv_sgq4k_f32(
             const float4 bh0 = *((device const float4 *)(yc0 + jhi));
             const float4 bh1 = *((device const float4 *)(yc1 + jhi));
 
-            const uint2 qv = *((device const uint2 *)(xb->qs + g*32 + lcol*4));
+            const uint2 qv  = *((device const uint2 *)(xb->qs  + g*32 + lcol*4));
+            const uint2 qv2 = *((device const uint2 *)(xb2->qs + g*32 + lcol*4));
 
-            uchar scl, mml, sch, mmh;
-            sgq4k_scale_min((int)(2*g  ), xb->scales, scl, mml);
-            sgq4k_scale_min((int)(2*g+1), xb->scales, sch, mmh);
+            uchar scl, mml, sch, mmh, scl2, mml2, sch2, mmh2;
+            sgq4k_scale_min((int)(2*g  ), xb->scales,  scl,  mml);
+            sgq4k_scale_min((int)(2*g+1), xb->scales,  sch,  mmh);
+            sgq4k_scale_min((int)(2*g  ), xb2->scales, scl2, mml2);
+            sgq4k_scale_min((int)(2*g+1), xb2->scales, sch2, mmh2);
 
             const float dl = dd*(float) scl, ml = dm*(float) mml;
             const float dh = dd*(float) sch, mh = dm*(float) mmh;
+            const float dl2 = dd2*(float) scl2, ml2 = dm2*(float) mml2;
+            const float dh2 = dd2*(float) sch2, mh2 = dm2*(float) mmh2;
 
             const float4 al0 = fma(unpack_unorm4x8_to_float(qv.x & 0x0F0F0F0Fu), dl, -ml);
             const float4 al1 = fma(unpack_unorm4x8_to_float(qv.y & 0x0F0F0F0Fu), dl, -ml);
             const float4 ah0 = fma(unpack_unorm4x8_to_float((qv.x >> 4) & 0x0F0F0F0Fu), dh, -mh);
             const float4 ah1 = fma(unpack_unorm4x8_to_float((qv.y >> 4) & 0x0F0F0F0Fu), dh, -mh);
+            const float4 bl0_2 = fma(unpack_unorm4x8_to_float(qv2.x & 0x0F0F0F0Fu), dl2, -ml2);
+            const float4 bl1_2 = fma(unpack_unorm4x8_to_float(qv2.y & 0x0F0F0F0Fu), dl2, -ml2);
+            const float4 bh0_2 = fma(unpack_unorm4x8_to_float((qv2.x >> 4) & 0x0F0F0F0Fu), dh2, -mh2);
+            const float4 bh1_2 = fma(unpack_unorm4x8_to_float((qv2.y >> 4) & 0x0F0F0F0Fu), dh2, -mh2);
 
             FOR_UNROLL (uint t = 0; t < 4; ++t) {
                 simdgroup_float8x8 a, b;
                 { thread auto & e = b.thread_elements(); e[0] = bl0[t]; e[1] = bl1[t]; }
-                { thread auto & e = a.thread_elements(); e[0] = al0[t]; e[1] = al1[t]; }
-                simdgroup_multiply_accumulate(acc, a, b, acc);
+                { thread auto & e = a.thread_elements(); e[0] = al0[t];   e[1] = al1[t];   }
+                simdgroup_multiply_accumulate(acc,  a, b, acc);
+                { thread auto & e = a.thread_elements(); e[0] = bl0_2[t]; e[1] = bl1_2[t]; }
+                simdgroup_multiply_accumulate(acc2, a, b, acc2);
                 { thread auto & e = b.thread_elements(); e[0] = bh0[t]; e[1] = bh1[t]; }
-                { thread auto & e = a.thread_elements(); e[0] = ah0[t]; e[1] = ah1[t]; }
-                simdgroup_multiply_accumulate(acc, a, b, acc);
+                { thread auto & e = a.thread_elements(); e[0] = ah0[t];   e[1] = ah1[t];   }
+                simdgroup_multiply_accumulate(acc,  a, b, acc);
+                { thread auto & e = a.thread_elements(); e[0] = bh0_2[t]; e[1] = bh1_2[t]; }
+                simdgroup_multiply_accumulate(acc2, a, b, acc2);
             }
         }
     }
 
+    device float * d0 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1;
     if (vrow) {
         thread auto & e = acc.thread_elements();
-        device float * d0 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1;
         if (vc0) d0[(uint64_t)(lcol  )*args.ne0 + i01] = e[0];
         if (vc1) d0[(uint64_t)(lcol+1)*args.ne0 + i01] = e[1];
+    }
+    if (vrow2) {
+        thread auto & e = acc2.thread_elements();
+        if (vc0) d0[(uint64_t)(lcol  )*args.ne0 + i02] = e[0];
+        if (vc1) d0[(uint64_t)(lcol+1)*args.ne0 + i02] = e[1];
     }
 }
 
