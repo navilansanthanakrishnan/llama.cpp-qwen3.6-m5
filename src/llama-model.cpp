@@ -1597,18 +1597,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 //     then we could just use metal for all layers
                 // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
                 void * addr = nullptr;
-                size_t first, last; // NOLINT
-                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
-                if (first >= last) {
-                    continue;
-                }
+                // Skip holes left by tensors assigned to another backend rather
+                // than mapping one min..max span over them. On Apple silicon the
+                // whole span is wired, so an interior host-assigned tensor costs
+                // real device memory for nothing: token_embd in a 27B Q4_K_M is
+                // 682 MiB sitting between output.weight and the blocks.
+                // 1 MiB keeps alignment padding merged.
+                const size_t max_gap = 1024*1024;
+                const auto ranges = ml.get_mapping_ranges(&addr, idx, ctx, max_gap);
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
-                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
-                if (buf == nullptr) {
-                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                for (const auto & r : ranges) {
+                    const size_t first = r.first;
+                    const size_t last  = r.second;
+                    if (first >= last) {
+                        continue;
+                    }
+                    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
+                    if (buf == nullptr) {
+                        throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                    }
+                    bufs.emplace_back(buf);
+                    buf_map.emplace(idx, buf);
                 }
-                bufs.emplace_back(buf);
-                buf_map.emplace(idx, buf);
             }
         } else {
             ggml_backend_buffer_t buf;
