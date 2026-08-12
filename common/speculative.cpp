@@ -2297,6 +2297,29 @@ common_speculative_init_result::common_speculative_init_result(
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
 
+    if (spec_mtp) {
+        // The MTP draft graph is ONE decoder block, but sched_reserve() sizes its
+        // compute buffer against min(n_ctx, n_ubatch) and that block's activations
+        // are as wide as the target's (n_ff = 17408), so a 1-layer graph reserves
+        // almost as much as the 64-layer target: 136 MiB against 148 MiB measured
+        // on Qwen3.6-27B. It is peak-live-activation-per-ubatch, not per-layer.
+        //
+        // n_batch must NOT be reduced: common_speculative_process() replays every
+        // target batch through the draft context to build the nextn layer's KV
+        // over the whole prompt, in chunks of the target's n_batch. n_ubatch only
+        // drives the internal, order-preserving split inside llama_decode, so it
+        // is free to clamp.
+        //
+        // Floor at n_parallel * (1 + n_max) so every steady-state MTP decode --
+        // the catch-up after a verify batch and the per-step draft -- still lands
+        // in a single ubatch, and at 32 so prompt chunking stays cheap.
+        const int32_t  n_max_dft = std::max(0, params.speculative.draft.n_max);
+        const uint32_t n_ub_need = (uint32_t) std::max<int64_t>(
+                (int64_t) std::max(1, params.n_parallel) * (1 + n_max_dft), 32);
+        const uint32_t n_ub_tgt  = cparams.n_ubatch ? cparams.n_ubatch : cparams.n_batch;
+        cparams.n_ubatch = std::min(n_ub_tgt, n_ub_need);
+    }
+
     std::string model_path;
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
