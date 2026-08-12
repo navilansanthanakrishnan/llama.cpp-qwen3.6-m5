@@ -8867,6 +8867,61 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // K-quant mat-vec: row-count gates, partial tiles, and multi-column widths.
+    //
+    // Motivation: above this point the ONLY K-quant mul_mat coverage is
+    // ne01 = 16, n = 1..9, k = 256 (the all_types loop). Backends that switch
+    // kernel or tile geometry on the row count are therefore completely
+    // untested -- a backend can select a different kernel for ne01 >= 2048 or
+    // 4096 and every existing case still passes, because none of them reaches
+    // those row counts. The Metal backend does exactly this.
+    //
+    // The ne01 values bracket plausible tile/threadgroup boundaries from both
+    // sides and include values that are NOT divisible by 8, which is what
+    // exercises the partial last threadgroup. n covers the speculative-decode
+    // verify widths (1 token + 1..4 draft tokens), which is where multi-column
+    // mat-vec instantiations are selected.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int64_t m : {1016, 1024, 2040, 2047, 2048, 2052, 2056, 4088, 4095, 4096, 4100, 4104}) {
+            for (int64_t n : {1, 2, 3, 4, 5}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 256, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
+    // K-quant mat-vec with a realistic k, at the row counts this model uses.
+    // Catches anything that depends on the number of super-blocks per row.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int64_t n : {1, 2, 3, 4}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, n,  5120, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  5120, n, 17408, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  6144, n,  5120, {1, 1}, {1, 1}));
+        }
+    }
+
+    // Large k. A row stride held in a 32-bit or narrower type overflows here:
+    // at k = 32768 a Q4_K row is 32768/256 * 144 = 18432 bytes, and an index
+    // computed as (row * nb01) in a short or int16 wraps and reads before the
+    // buffer. Correct results at small k say nothing about this.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int64_t k : {32768, 40960}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, 1, k, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 512, 3, k, {1, 1}, {1, 1}));
+        }
+    }
+
+    // mul_mm partial tiles in both dimensions, across the batch sizes that
+    // select between the mat-vec and mat-mat paths. Backends commonly tile
+    // 32x32 or 64x32 per threadgroup; these land on and just past the edges.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_F16}) {
+        for (int64_t m : {31, 32, 33, 63, 64, 65, 127, 128, 129}) {
+            for (int64_t n : {8, 9, 16, 31, 32, 33, 64, 65}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 256, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
