@@ -2676,7 +2676,7 @@ void common_speculative_draft(common_speculative * spec) {
                 // token, then the draft so far
                 llama_tokens cur;
                 cur.reserve(n_gram + result.size() + 1);
-                const size_t n_tail = std::min<size_t>(hist.size(), (size_t) n_gram);
+                const size_t n_tail = std::min<size_t>(hist.size(), (size_t) n_gram + 4);
                 cur.insert(cur.end(), hist.end() - n_tail, hist.end());
                 cur.push_back(dp.id_last);
                 cur.insert(cur.end(), result.begin(), result.end());
@@ -2685,19 +2685,32 @@ void common_speculative_draft(common_speculative * spec) {
                     continue;
                 }
 
-                // most recent earlier occurrence of the current n-gram
+                // Most recent earlier occurrence of the current n-gram, backing
+                // off to shorter contexts when the longer one does not appear.
+                // A fixed-width match is too strict here: it fires only on
+                // near-verbatim repetition, which is why the first version of
+                // this only had its appended tokens accepted about 5% of the
+                // time. Shorter matches are less precise, but a wrong appended
+                // token costs only its share of a verify column that is already
+                // paid for, while a right one is a token the model never had to
+                // draft.
                 int at = -1;
-                for (int i = (int) hist.size() - n_gram - 1; i >= 0; --i) {
-                    bool match = true;
-                    for (int j = 0; j < n_gram; ++j) {
-                        if (hist[i + j] != cur[cur.size() - n_gram + j]) {
-                            match = false;
+                for (int ng = n_gram; ng >= 2 && at < 0; --ng) {
+                    if ((int) cur.size() < ng || (int) hist.size() <= ng) {
+                        continue;
+                    }
+                    for (int i = (int) hist.size() - ng - 1; i >= 0; --i) {
+                        bool match = true;
+                        for (int j = 0; j < ng; ++j) {
+                            if (hist[i + j] != cur[cur.size() - ng + j]) {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match) {
+                            at = i + ng;
                             break;
                         }
-                    }
-                    if (match) {
-                        at = i + n_gram;
-                        break;
                     }
                 }
 
