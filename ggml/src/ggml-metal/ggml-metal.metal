@@ -8386,7 +8386,7 @@ kernel void kernel_mul_mv_q3_K_f32(
 // nr0*nr1 accumulators. Measure maxTotalThreadsPerThreadgroup per compiled
 // pipeline (logged at GGML_LOG_DEBUG) before trusting any (nr0, nr1) pair --
 // a drop there means the variant spilled and the win is already gone.
-template<int nr0, int nr1, typename args_t>
+template<int nr0, int nr1 = 1, typename args_t>
 void kernel_mul_mv_q4_K_f32_impl(
         args_t args,
         device const char * src0,
@@ -8476,27 +8476,48 @@ void kernel_mul_mv_q4_K_f32_impl(
 
             device const uint16_t * q2 = q1 + 32;
 
+            // Loop order matters more than anything else in this kernel. The
+            // weight word must be loaded ONCE and reused across all nr1
+            // columns; with the column loop outermost the load sits inside it
+            // and the whole point of the kernel is lost -- measured 32% SLOWER
+            // than the plain per-column mat-vec that way.
+            float4 acc1[nr1];
+            float4 acc2[nr1];
             FOR_UNROLL (short c = 0; c < nr1; ++c) {
-                float4 acc1 = {0.f, 0.f, 0.f, 0.f};
-                float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+                acc1[c] = {0.f, 0.f, 0.f, 0.f};
+                acc2[c] = {0.f, 0.f, 0.f, 0.f};
+            }
 
-                FOR_UNROLL (short i = 0; i < 4; ++i) {
-                    // q1[i]/q2[i] are read once here and reused for every c by
-                    // the compiler: they are loop-invariant in c.
-                    acc1[0] += yl[c][2*i + 0] * (q1[i] & 0x000F);
-                    acc1[1] += yl[c][2*i + 1] * (q1[i] & 0x0F00);
-                    acc1[2] += yl[c][2*i + 8] * (q1[i] & 0x00F0);
-                    acc1[3] += yl[c][2*i + 9] * (q1[i] & 0xF000);
-                    acc2[0] += yh[c][2*i + 0] * (q2[i] & 0x000F);
-                    acc2[1] += yh[c][2*i + 1] * (q2[i] & 0x0F00);
-                    acc2[2] += yh[c][2*i + 8] * (q2[i] & 0x00F0);
-                    acc2[3] += yh[c][2*i + 9] * (q2[i] & 0xF000);
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
+                const uint16_t w1 = q1[i];
+                const uint16_t w2 = q2[i];
+
+                const float w1a = (float) (w1 & 0x000F);
+                const float w1b = (float) (w1 & 0x0F00);
+                const float w1c = (float) (w1 & 0x00F0);
+                const float w1d = (float) (w1 & 0xF000);
+                const float w2a = (float) (w2 & 0x000F);
+                const float w2b = (float) (w2 & 0x0F00);
+                const float w2c = (float) (w2 & 0x00F0);
+                const float w2d = (float) (w2 & 0xF000);
+
+                FOR_UNROLL (short c = 0; c < nr1; ++c) {
+                    acc1[c][0] += yl[c][2*i + 0] * w1a;
+                    acc1[c][1] += yl[c][2*i + 1] * w1b;
+                    acc1[c][2] += yl[c][2*i + 8] * w1c;
+                    acc1[c][3] += yl[c][2*i + 9] * w1d;
+                    acc2[c][0] += yh[c][2*i + 0] * w2a;
+                    acc2[c][1] += yh[c][2*i + 1] * w2b;
+                    acc2[c][2] += yh[c][2*i + 8] * w2c;
+                    acc2[c][3] += yh[c][2*i + 9] * w2d;
                 }
+            }
 
-                sumf[row][c] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
-                                         (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
-                                         (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
-                                         (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+            FOR_UNROLL (short c = 0; c < nr1; ++c) {
+                sumf[row][c] += dh[0] * ((acc1[c][0] + 1.f/256.f * acc1[c][1]) * sc8[0] +
+                                         (acc1[c][2] + 1.f/256.f * acc1[c][3]) * sc8[1] * 1.f/16.f +
+                                         (acc2[c][0] + 1.f/256.f * acc2[c][1]) * sc8[4] +
+                                         (acc2[c][2] + 1.f/256.f * acc2[c][3]) * sc8[5] * 1.f/16.f) -
                                 dh[1] * (sumy[c][0] * sc8[2] + sumy[c][1] * sc8[3] +
                                          sumy[c][2] * sc8[6] + sumy[c][3] * sc8[7]);
             }

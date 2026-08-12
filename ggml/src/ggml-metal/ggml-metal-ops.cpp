@@ -2369,7 +2369,22 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //       my current hypothesis is that the work grid is not evenly divisible for different nsg
         //       values and there can be some tail effects when nsg is high. need to confirm this
         //
-        const int nsg    = 2;                 // num simdgroups per threadgroup
+        // Simdgroups per threadgroup for the weight-reuse mat-vec. Upstream
+        // hardcodes 2 with a comment saying the author was unsure why larger
+        // values did not help, and an occupancy search commented out above.
+        // This is a threadgroups-per-core quantity and this part has 16 cores,
+        // so it is exactly the sort of constant that must be re-derived rather
+        // than inherited. GGML_METAL_MV_EXT_NSG / _NXPSG override it.
+        int nsg = 2;
+        {
+            static const int nsg_env = []() {
+                const char * e = getenv("GGML_METAL_MV_EXT_NSG");
+                return e ? atoi(e) : 0;
+            }();
+            if (nsg_env > 0) {
+                nsg = nsg_env;
+            }
+        }
 
         // num threads along row per simdgroup
         int16_t nxpsg = 0;
@@ -2379,6 +2394,15 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             nxpsg = 8;
         } else {
             nxpsg = 4;
+        }
+        {
+            static const int nx_env = []() {
+                const char * e = getenv("GGML_METAL_MV_EXT_NXPSG");
+                return e ? atoi(e) : 0;
+            }();
+            if (nx_env > 0 && ne00 % (nx_env*16) == 0) {
+                nxpsg = (int16_t) nx_env;
+            }
         }
 
         const int16_t nypsg  = 32/nxpsg;          // num threads along col per simdgroup (i.e. a simdgroup processes that many src0 rows at a time)
