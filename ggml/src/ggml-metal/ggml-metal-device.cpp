@@ -792,7 +792,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    const char * mm_sfx = "";
+    {
+        // Narrow-N tile for speculative verify widths. The default 32-wide
+        // tile computes 32 columns for the 2..8 that speculation actually
+        // presents. GGML_METAL_NO_NARROW_N=1 restores upstream.
+        static const bool off = getenv("GGML_METAL_NO_NARROW_N") != nullptr;
+        const int64_t n1 = op->src[1]->ne[1];
+        const ggml_type t0 = op->src[0]->type;
+        if (!off && n1 >= 2 && n1 <= 16 &&
+            (t0 == GGML_TYPE_Q4_K || t0 == GGML_TYPE_Q5_K || t0 == GGML_TYPE_Q6_K)) {
+            mm_sfx = "_n16";
+        }
+    }
+    snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), mm_sfx);
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
              base, bc_inp, bc_out, ne12, ne13, r2, r3);
 
@@ -820,7 +833,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         res.smem = smem_a;
     } else {
         res.nr0 = 64;
-        res.nr1 = 32;
+        res.nr1 = mm_sfx[0] ? 16 : 32;
 
         res.smem = bc_out ? 8192 : (4096 + 2048);
     }
