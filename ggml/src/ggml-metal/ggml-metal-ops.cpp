@@ -2291,6 +2291,22 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// Minimum src1 column count at which K-quants use the weight-reuse mat-vec
+// (mul_mv_ext). Upstream sets this to 4, which leaves widths 2 and 3 on the
+// plain mat-vec, where the weight matrix is streamed once PER COLUMN because
+// the dispatch puts ne11 on grid.y with nr1 = 1. Those two widths are exactly
+// what speculative decoding presents at draft depth 1 and 2.
+//
+// GGML_METAL_NO_KQUANT_EXT2=1 restores upstream behaviour, so both arms of an
+// A/B live in one binary and no rebuild sits between them.
+static int ggml_metal_kquant_ext_min_ne11(void) {
+    static int v = -1;
+    if (v < 0) {
+        v = getenv("GGML_METAL_NO_KQUANT_EXT2") ? 4 : 2;
+    }
+    return v;
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2348,7 +2364,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_Q8_0 ||
            op->src[0]->type == GGML_TYPE_MXFP4 ||
            op->src[0]->type == GGML_TYPE_IQ4_NL ||
-           false) && (ne11 >= 2 && ne11 <= 8)
+           false) && (ne11 >= ggml_metal_kquant_ext_min_ne11() && ne11 <= 8)
          ) ||
          (
           (
@@ -2357,7 +2373,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_Q6_K ||
            op->src[0]->type == GGML_TYPE_Q2_K ||
            op->src[0]->type == GGML_TYPE_Q3_K ||
-           false) && (ne11 >= 4 && ne11 <= 8)
+           false) && (ne11 >= 2 && ne11 <= 8)
          )
         )
        ) {
@@ -2372,8 +2388,25 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         const int nsg    = 2;                 // num simdgroups per threadgroup
 
         // num threads along row per simdgroup
+        // K-quants want more rows per simdgroup than the fp/legacy paths do.
+        // nypsg = 32/nxpsg is rows per simdgroup, so nxpsg=16 gives 2 rows and
+        // nxpsg=8 gives 4. The affine super-block decode has enough ALU per
+        // weight load to favour the wider row tile, while the fp modes' 4x4
+        // vectorized dot is balanced at 16 lanes. MLX draws the same line: its
+        // affine qmv uses k_lanes=8 where its fp path uses 16.
+        //
+        // This branch was previously unreachable for K-quants (they were gated
+        // to ne11 >= 4 and this needs ne11 < 3), so lowering the gate above
+        // would have routed them into an untested and wrong-for-them setting.
+        const bool is_kquant =
+            op->src[0]->type == GGML_TYPE_Q4_K ||
+            op->src[0]->type == GGML_TYPE_Q5_K ||
+            op->src[0]->type == GGML_TYPE_Q6_K ||
+            op->src[0]->type == GGML_TYPE_Q2_K ||
+            op->src[0]->type == GGML_TYPE_Q3_K;
+
         int16_t nxpsg = 0;
-        if (ne00 % 256 == 0 && ne11 < 3) {
+        if (ne00 % 256 == 0 && ne11 < 3 && !(is_kquant && ggml_metal_kquant_ext_min_ne11() == 2)) {
             nxpsg = 16;
         } else if (ne00 % 128 == 0) {
             nxpsg = 8;
