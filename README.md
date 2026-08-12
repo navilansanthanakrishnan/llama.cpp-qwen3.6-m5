@@ -1,9 +1,13 @@
-> **Fork note.** Adds a Metal path for Apple Silicon that dequantizes K-quantized
-> weights directly into simdgroup matrix-unit registers, avoiding threadgroup
-> staging, for Q4_K/Q5_K/Q6_K at batch widths 4–8. On an M5 Pro running
-> Qwen3.6-27B-Q4_K_M this reduces width-8 verification from 215 ms to 110 ms and
-> raises speculative decode from 14.6 to 23.8 tok/s, with token-exact output.
-> Set `GGML_METAL_SGMV_DISABLE=1` to fall back to the upstream path.
+> **This is a fork.** Metal-backend work for Qwen3.6-27B-Q4_K_M on an Apple M5 Pro:
+> decode **23.8 tok/s** with speculation, up from **14.6**, against a **16.4 tok/s**
+> bandwidth ceiling at one token per forward pass. The path is new — K-quantized
+> weights dequantized straight into simdgroup matrix-unit registers, with no
+> threadgroup staging, which no llama.cpp backend does. Plus two things worth
+> upstreaming on their own: a `dequantize_q4_K` scale that goes subnormal for
+> 99.9998% of blocks on every Q4_K model, and `test-backend-ops` coverage that
+> caught two wrong kernels before either was timed. Details:
+> **[QWEN36-M5.md](QWEN36-M5.md)**. Branch `sgmv-q4k` is the tuned stack; `trunk` is
+> the upstream commit it forks from.
 
 # llama.cpp
 
