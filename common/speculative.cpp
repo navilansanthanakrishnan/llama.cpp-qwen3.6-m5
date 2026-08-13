@@ -482,11 +482,29 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
 
+        // Draft proposal policy.
+        //
+        // common_sampler_init appends llama_sampler_init_dist() to every chain
+        // (common/sampling.cpp), so top_k=10 makes the draft propose a RANDOM
+        // DRAW from its top ten. The target here verifies greedily, so any draw
+        // that is not the draft's own argmax is a rejection bought for nothing.
+        // Against a greedy verifier the acceptance-maximising proposal is the
+        // draft's argmax, and top_k=1 makes the appended dist sampler degenerate
+        // to exactly that.
+        //
+        // This is safe ONLY because the target is greedy: acceptance is then an
+        // equality test on the argmax and the draft's distribution never enters
+        // it. Under a sampling target the standard rejection rule uses the draft
+        // distribution, and narrowing it there would bias the output -- hence
+        // the knob rather than a hard-coded 1.
+        static const int draft_top_k = getenv("LLAMA_ARG_SPEC_DRAFT_TOPK")
+                                     ? atoi(getenv("LLAMA_ARG_SPEC_DRAFT_TOPK")) : 10;
+
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            sparams.top_k    = draft_top_k;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
@@ -496,7 +514,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(draft_top_k));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
