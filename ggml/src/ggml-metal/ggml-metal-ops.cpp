@@ -2445,11 +2445,21 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //       my current hypothesis is that the work grid is not evenly divisible for different nsg
         //       values and there can be some tail effects when nsg is high. need to confirm this
         //
-        const int nsg    = 2;                 // num simdgroups per threadgroup
+        // Swept here (LEDGER 004 was opened for exactly this and never measured).
+        // The question is whether this kernel can be tuned to the ~71 ms that
+        // LEDGER 082 says a load-once scalar multi-column mat-vec should reach at
+        // ne11=4, against the 123 ms it delivers today.
+        static const int nsg_env   = getenv("GGML_METAL_EXT_NSG")   ? atoi(getenv("GGML_METAL_EXT_NSG"))   : 0;
+        static const int nxpsg_env = getenv("GGML_METAL_EXT_NXPSG") ? atoi(getenv("GGML_METAL_EXT_NXPSG")) : 0;
+        static const int r1ptg_env = getenv("GGML_METAL_EXT_R1PTG") ? atoi(getenv("GGML_METAL_EXT_R1PTG")) : 0;
+
+        const int nsg    = nsg_env > 0 ? nsg_env : 2;   // num simdgroups per threadgroup
 
         // num threads along row per simdgroup
         int16_t nxpsg = 0;
-        if (ne00 % 256 == 0 && ne11 < 3) {
+        if (nxpsg_env > 0) {
+            nxpsg = (int16_t) nxpsg_env;
+        } else if (ne00 % 256 == 0 && ne11 < 3) {
             nxpsg = 16;
         } else if (ne00 % 128 == 0) {
             nxpsg = 8;
@@ -2477,6 +2487,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             default:
                 GGML_ABORT("unsupported ne11");
         };
+
+        if (r1ptg_env > 0 && r1ptg_env <= ne11) {
+            r1ptg = (int16_t) r1ptg_env;
+        }
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg);
 
