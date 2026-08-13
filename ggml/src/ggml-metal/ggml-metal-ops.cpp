@@ -2347,6 +2347,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     static const bool sgq4k_disable = getenv("GGML_METAL_SGMV_DISABLE") != nullptr;
     // per-type opt-out, so each type's contribution can be A/B'd on its own
     static const bool sgq5k_disable = getenv("GGML_METAL_SGMV_NO_Q5K") != nullptr;
+    static const int sgq4k_nmin = getenv("GGML_METAL_SGMV_NMIN")
+                                ? atoi(getenv("GGML_METAL_SGMV_NMIN")) : 4;
 
     // The narrow-N tile, where it applies, reaches the tensor units; this kernel
     // cannot (simdgroup_multiply_accumulate runs on the ordinary ALUs at
@@ -2361,7 +2363,13 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         // they do not use. Measured against the trunk path at m=4096 k=14336:
         // n=2 0.70x, n=3 1.05x, n=4 1.12x, n=5 1.25x, n=8 2.17x. Cost is flat
         // in width (233-235 us for n=2..8) where trunk climbs 163->510 us.
-        ne11 >= 4 && ne11 <= 8 &&
+        // Lower bound is env-selectable so the W=3 pathology can be A/B'd on one
+        // binary. LEDGER 073 measured T_ver(3) = 134.9 ms against T_ver(8) = 111.3:
+        // below this gate K-quants fall back to kernel_mul_mv_q4_K_f32_impl, which
+        // takes the column index as tgpig.y and therefore re-streams all 16.52 GB
+        // once per column. This kernel is flat in width, so covering ne11=3 trades
+        // 3 wasted fragment columns for a whole extra pass over the weights.
+        ne11 >= sgq4k_nmin && ne11 <= 8 &&
         ne00 % 256 == 0 &&
         nb10 == sizeof(float) &&        // src1 contiguous along the reduction
         nb00 == ggml_type_size(op->src[0]->type)) {
