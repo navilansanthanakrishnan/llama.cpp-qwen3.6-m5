@@ -2292,24 +2292,12 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
 }
 
 // True when the narrow-N mat-mat tile should handle this shape: K-quant weights
-// at a speculative verify width. Upstream would send these to the small-batch
-// mat-vec, which never reaches the matrix units, or to a 128-wide mat-mat tile
-// that discards 96% of its arithmetic.
+// at a speculative verify width. Upstream sends these either to the small-batch
+// mat-vec, which never reaches the tensor units at all, or to a 128-wide
+// mat-mat tile that discards most of its arithmetic. Delegates the decision so
+// dispatch and pipeline selection cannot disagree about which tile runs.
 static bool ggml_metal_use_narrow_n(const ggml_tensor * op) {
-    static const bool off = getenv("GGML_METAL_NO_NARROW_N") != nullptr;
-    if (off) {
-        return false;
-    }
-    const int64_t ne11 = op->src[1]->ne[1];
-    const int64_t ne00 = op->src[0]->ne[0];
-    const ggml_type t0 = op->src[0]->type;
-    if (op->src[1]->type != GGML_TYPE_F32 || ne00 < 64) {
-        return false;
-    }
-    if (ne11 < 2 || ne11 > 16) {
-        return false;
-    }
-    return t0 == GGML_TYPE_Q4_K || t0 == GGML_TYPE_Q5_K || t0 == GGML_TYPE_Q6_K;
+    return ggml_metal_mul_mm_narrow_nrb(op) > 0;
 }
 
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
@@ -2360,7 +2348,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // per-type opt-out, so each type's contribution can be A/B'd on its own
     static const bool sgq5k_disable = getenv("GGML_METAL_SGMV_NO_Q5K") != nullptr;
 
-    if (!sgq4k_disable &&
+    // The narrow-N tile, where it applies, reaches the tensor units; this kernel
+    // cannot (simdgroup_multiply_accumulate runs on the ordinary ALUs at
+    // 6.1 TFLOP/s, LEDGER 074), so let the tile win wherever it is routed and
+    // use GGML_METAL_NARROW_MIN/MAX to decide where that is.
+    if (!sgq4k_disable && !ggml_metal_use_narrow_n(op) &&
         (op->src[0]->type == GGML_TYPE_Q4_K ||
          (op->src[0]->type == GGML_TYPE_Q5_K && !sgq5k_disable) ||
          op->src[0]->type == GGML_TYPE_Q6_K) &&

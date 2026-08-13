@@ -768,6 +768,71 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_sgq4k(ggm
     return res;
 }
 
+// Width of the narrow mat-mat N tile to use for this op, or 0 for the default.
+//
+// Speculative verify presents src1 widths of 2..32. The default tile is 128
+// columns on the tensor path, so at ne11=9 it issues 128 columns of arithmetic
+// for 9 — measured as a fixed +213 ms step in T_ver at exactly that width
+// (LEDGER 073), and flat out to ne11=64 because the waste is what dominates.
+//
+// Only A is staged into threadgroup memory; B is read from device memory
+// directly. So for any ne11 <= NRB there is exactly one N tile and the amount of
+// A staged is identical whatever the tile width — narrowing removes wasted
+// columns and nothing else. Pick the smallest instantiated tile that still
+// covers ne11.
+//
+// Env overrides exist so one binary can serve a whole sweep:
+//   GGML_METAL_NO_NARROW_N=1   upstream routing (the A arm of any A/B)
+//   GGML_METAL_NARROW_NRB=N    force the tile width to 8, 16 or 32
+//   GGML_METAL_NARROW_MAX=N    largest ne11 to route here (default 32)
+int ggml_metal_mul_mm_narrow_nrb(const ggml_tensor * op) {
+    static const bool off = getenv("GGML_METAL_NO_NARROW_N") != nullptr;
+    if (off) {
+        return 0;
+    }
+
+    if (op->src[1]->type != GGML_TYPE_F32) {
+        return 0;
+    }
+
+    const ggml_type t0 = op->src[0]->type;
+    if (t0 != GGML_TYPE_Q4_K && t0 != GGML_TYPE_Q5_K && t0 != GGML_TYPE_Q6_K) {
+        return 0;
+    }
+
+    if (op->src[0]->ne[0] < 64) {
+        return 0;
+    }
+
+    static const int nmax = getenv("GGML_METAL_NARROW_MAX") ? atoi(getenv("GGML_METAL_NARROW_MAX")) : 32;
+    // Default lower bound is 9, not 2, and the reason is measured. Fitting both
+    // paths over ne11 = 4..32 on this model gives
+    //     sgmv      = 65.7 + 5.70*ne11 ms
+    //     narrow-N  = 154  + 1.89*ne11 ms
+    // The tensor units cut the per-column slope by 3x, but the narrow tile
+    // carries a 154 ms fixed cost: with only ne11 columns of matmul per tile
+    // there is no longer enough work to hide the A-staging, which the 128-wide
+    // tile hides completely. They cross at ne11 ~ 23. So below 9 this would be a
+    // regression against the kernel already there, and from 9 up it replaces a
+    // path that costs 330+ ms flat (LEDGER 073) with 180-215.
+    static const int nmin = getenv("GGML_METAL_NARROW_MIN") ? atoi(getenv("GGML_METAL_NARROW_MIN")) :  9;
+
+    const int64_t ne11 = op->src[1]->ne[1];
+    if (ne11 < nmin || ne11 > nmax) {
+        return 0;
+    }
+
+    static const int forced = getenv("GGML_METAL_NARROW_NRB") ? atoi(getenv("GGML_METAL_NARROW_NRB")) : 0;
+    if (forced > 0) {
+        // a forced tile narrower than ne11 would silently drop columns
+        return forced >= ne11 ? forced : 0;
+    }
+
+    if (ne11 <=  8) return  8;
+    if (ne11 <= 16) return 16;
+    return 32;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];
@@ -792,19 +857,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    const char * mm_sfx = "";
-    {
-        // Narrow-N tile for speculative verify widths. The default 32-wide
-        // tile computes 32 columns for the 2..8 that speculation actually
-        // presents. GGML_METAL_NO_NARROW_N=1 restores upstream.
-        static const bool off = getenv("GGML_METAL_NO_NARROW_N") != nullptr;
-        const int64_t n1 = op->src[1]->ne[1];
-        const ggml_type t0 = op->src[0]->type;
-        if (!off && n1 >= 2 && n1 <= 16 &&
-            (t0 == GGML_TYPE_Q4_K || t0 == GGML_TYPE_Q5_K || t0 == GGML_TYPE_Q6_K)) {
-            mm_sfx = "_n16";
-        }
+    const int nrb_narrow = ggml_metal_mul_mm_narrow_nrb(op);
+
+    char mm_sfx[8] = "";
+    if (nrb_narrow > 0) {
+        snprintf(mm_sfx, sizeof(mm_sfx), "_n%d", nrb_narrow);
     }
+
     snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), mm_sfx);
     snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
              base, bc_inp, bc_out, ne12, ne13, r2, r3);
@@ -827,13 +886,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     if (has_tensor) {
         res.nr0 = NRA;
-        res.nr1 = NRB;
+        // The grid is sized from the tile the kernel actually computes. Leaving
+        // this at the default NRB while a narrow instantiation runs would
+        // under-dispatch the N direction for any ne11 above the narrow width.
+        res.nr1 = nrb_narrow > 0 ? nrb_narrow : NRB;
 
         const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
         res.smem = smem_a;
     } else {
         res.nr0 = 64;
-        res.nr1 = mm_sfx[0] ? 16 : 32;
+        res.nr1 = nrb_narrow > 0 ? nrb_narrow : 32;
 
         res.smem = bc_out ? 8192 : (4096 + 2048);
     }
