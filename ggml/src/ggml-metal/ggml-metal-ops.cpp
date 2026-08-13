@@ -2348,7 +2348,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // per-type opt-out, so each type's contribution can be A/B'd on its own
     static const bool sgq5k_disable = getenv("GGML_METAL_SGMV_NO_Q5K") != nullptr;
     static const int sgq4k_nmin = getenv("GGML_METAL_SGMV_NMIN")
-                                ? atoi(getenv("GGML_METAL_SGMV_NMIN")) : 4;
+                                ? atoi(getenv("GGML_METAL_SGMV_NMIN")) : 3;
 
     // The narrow-N tile, where it applies, reaches the tensor units; this kernel
     // cannot (simdgroup_multiply_accumulate runs on the ordinary ALUs at
