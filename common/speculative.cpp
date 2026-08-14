@@ -155,6 +155,9 @@ struct common_speculative_impl {
     int64_t t_begin_us  = 0; // total time spent in refresh of this implementation in microseconds.
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
+    int64_t t_process_us = 0; // total time in process(): for MTP this is the catch-up decode that
+                              // advances the draft context's own state over the accepted tokens.
+                              // Untimed until now, and it is a whole extra forward pass per cycle.
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {}
 
@@ -482,11 +485,29 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         // TODO: fix, how to call without malloc
         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
 
+        // Draft proposal policy.
+        //
+        // common_sampler_init appends llama_sampler_init_dist() to every chain
+        // (common/sampling.cpp), so top_k=10 makes the draft propose a RANDOM
+        // DRAW from its top ten. The target here verifies greedily, so any draw
+        // that is not the draft's own argmax is a rejection bought for nothing.
+        // Against a greedy verifier the acceptance-maximising proposal is the
+        // draft's argmax, and top_k=1 makes the appended dist sampler degenerate
+        // to exactly that.
+        //
+        // This is safe ONLY because the target is greedy: acceptance is then an
+        // equality test on the argmax and the draft's distribution never enters
+        // it. Under a sampling target the standard rejection rule uses the draft
+        // distribution, and narrowing it there would bias the output -- hence
+        // the knob rather than a hard-coded 1.
+        static const int draft_top_k = getenv("LLAMA_ARG_SPEC_DRAFT_TOPK")
+                                     ? atoi(getenv("LLAMA_ARG_SPEC_DRAFT_TOPK")) : 10;
+
         smpls.resize(n_seq);
         for (auto & s : smpls) {
             common_params_sampling sparams;
             sparams.no_perf  = false;
-            sparams.top_k    = 10;
+            sparams.top_k    = draft_top_k;
             sparams.samplers = { COMMON_SAMPLER_TYPE_TOP_K };
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
@@ -496,7 +517,7 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         if (this->params.backend_sampling) {
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
+                llama_sampler_chain_add(chain, llama_sampler_init_top_k(draft_top_k));
 
                 if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
                     SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
@@ -1438,7 +1459,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        //
+        // The catch-up is a whole extra forward pass of the MTP block per cycle,
+        // replaying the tokens the target just decoded so the draft context's own
+        // state advances. Whether qwen35 actually needs it is untested -- the
+        // draft is re-anchored every cycle from the target's hidden state
+        // (pending_h), so the state this rebuilds may be redundant. Skipping it
+        // costs nothing if acceptance holds and saves a forward pass if it does.
+        static const bool skip_catchup = getenv("LLAMA_ARG_SPEC_SKIP_CATCHUP") != nullptr;
+        if (!is_mem_shared && !skip_catchup) {
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {
@@ -2549,6 +2578,7 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     }
 
     for (auto & impl : spec->impls) {
+        common_time_meas tm(impl->t_process_us, !impl->gen_perf);
         result = result && impl->process(batch);
     }
 
@@ -2718,7 +2748,47 @@ void common_speculative_draft(common_speculative * spec) {
                     continue;
                 }
 
-                for (int k = 0; k < n_ext && at + k < (int) hist.size(); ++k) {
+                // Fill the verify width, do not just add a fixed n_ext.
+                //
+                // The verify kernel computes a fixed 8-column simdgroup fragment
+                // whatever ne11 is (LEDGER 079), so every drafted token up to the
+                // width budget is free on the verify side. Measured at LEDGER 101:
+                // the draft produces ~4.34 tokens against a budget of 7, because
+                // the MTP chain stops early on p_min and the extension then adds a
+                // fixed 3 regardless. Those unused columns are free acceptance
+                // being discarded. Fill to the budget instead.
+                //
+                // LLAMA_ARG_SPEC_EXT_FILL=0 restores the fixed-n_ext behaviour.
+                static const bool ext_fill = getenv("LLAMA_ARG_SPEC_EXT_FILL")
+                                           ? atoi(getenv("LLAMA_ARG_SPEC_EXT_FILL")) != 0 : true;
+
+                // Width budget: the per-sequence override when set, else the
+                // configured draft width. Defaults to 7, which with the frozen
+                // --spec-draft-n-max 7 is exactly one 8-wide verify fragment.
+                static const int ext_budget = getenv("LLAMA_ARG_SPEC_EXT_BUDGET")
+                                            ? atoi(getenv("LLAMA_ARG_SPEC_EXT_BUDGET")) : 7;
+
+                int n_add = n_ext;
+                if (ext_fill) {
+                    // Fill to the budget and NEVER past it. An earlier version kept a
+                    // floor of n_ext here, which adds tokens even when the budget is
+                    // already spent and trips
+                    //   GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max)
+                    // in llama_context::decode, because the target context sizes its
+                    // output buffer from --spec-draft-n-max at creation.
+                    // dp.n_max is the server's per-sequence override and is derived
+                    // from the REMAINING CONTEXT, so it is routinely far larger than
+                    // the verify width. Take the min, never prefer it: treating it as
+                    // the budget drafts hundreds of tokens and trips
+                    //   GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max)
+                    int budget = ext_budget;
+                    if (dp.n_max > 0) {
+                        budget = std::min(budget, (int) dp.n_max);
+                    }
+                    n_add = std::max(0, budget - (int) result.size());
+                }
+
+                for (int k = 0; k < n_add && at + k < (int) hist.size(); ++k) {
                     result.push_back(hist[at + k]);
                 }
             }
@@ -2798,8 +2868,9 @@ void common_speculative_print_stats(const common_speculative * spec) {
             std::ostringstream oss;
             oss << std::fixed << std::setprecision(3) << impl->t_begin_us / 1000.0 << ", ";
             oss << std::fixed << std::setprecision(3) << impl->t_draft_us / 1000.0 << ", ";
-            oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0;
-            str_perf = ", dur(b,g,a) = " + oss.str() + " ms";
+            oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0 << ", ";
+            oss << std::fixed << std::setprecision(3) << impl->t_process_us / 1000.0;
+            str_perf = ", dur(begin,draft,accept,process) = " + oss.str() + " ms";
         } else {
             str_perf = "";
         }

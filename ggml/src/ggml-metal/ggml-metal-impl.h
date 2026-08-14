@@ -60,6 +60,14 @@
 #define N_R0_Q6_K 2
 #define N_SG_Q6_K 2
 
+// src0 rows per simdgroup for the multi-column (nr1 > 1) K-quant mat-vec kernels.
+// these are separate from the nr1 == 1 constants above because nr0*nr1 is the accumulator count,
+// which - together with the nr1 float4s of live activations - is what bounds the occupancy of
+// those kernels. keep nr0*nr1 small.
+#define N_R0_Q4_K_R1 2
+#define N_R0_Q5_K_R1 2
+#define N_R0_Q6_K_R1 2
+
 #define N_R0_IQ1_S 4
 #define N_SG_IQ1_S 2
 
@@ -932,6 +940,7 @@ typedef struct {
     int32_t  ns02;
     int32_t  ns12;
     int32_t  ns22;
+    int32_t  nss;  // stride in floats between the state snapshot slots in the state_out buffer
     int32_t  ne0;
     int32_t  ne1;
     int32_t  ne2;

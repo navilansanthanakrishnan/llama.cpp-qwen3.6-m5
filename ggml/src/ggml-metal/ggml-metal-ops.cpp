@@ -88,6 +88,52 @@ struct ggml_metal_op {
         return ggml_can_fuse_ext(gf, idxs.data() + i0, ops, n_ops);
     }
 
+    // index of the node at position i in the original graph
+    int node_gf(int i) const {
+        assert(i >= 0 && i < (int) idxs.size());
+        return idxs[i];
+    }
+
+    // find the graph index of a node in the range [i0_gf, i1_gf) of the original graph, -1 if absent
+    // note: needed because the view/no-op nodes are not in idxs and the metal graph optimizer is
+    //       free to reorder them, so their position relative to a real op is not fixed
+    int find_node_gf(const ggml_tensor * t, int i0_gf, int i1_gf) const {
+        for (int i = std::max(i0_gf, idx_start); i < std::min(i1_gf, idx_end); i++) {
+            if (ggml_graph_node(gf, i) == t) {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    // same as can_fuse(), but for patterns that involve view/no-op nodes - those are not present in
+    //   idxs, so here the nodes are addressed with their indices in the original graph
+    //
+    // outputs are positions, within idxs_gf, of the nodes that are still needed after the fusion -
+    //   all the other nodes of the pattern have to be fully consumed by it
+    //
+    bool can_fuse_subgraph(const int * idxs_gf, int n_ops, const ggml_op * ops, std::initializer_list<int> outputs) const {
+        assert(use_fusion);
+        assert(outputs.size() > 0 && outputs.size() <= GGML_MAX_SRC);
+
+        // note: same as in can_fuse() - never fuse across the boundary of the current split
+        for (int i = 0; i < n_ops; ++i) {
+            if (idxs_gf[i] < idx_start || idxs_gf[i] >= idx_end) {
+                return false;
+            }
+        }
+
+        int idxs_out[GGML_MAX_SRC];
+
+        int n_out = 0;
+        for (int o : outputs) {
+            idxs_out[n_out++] = idxs_gf[o];
+        }
+
+        return ggml_can_fuse_subgraph_ext(gf, idxs_gf, n_ops, ops, idxs_out, n_out);
+    }
+
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
     ggml_metal_encoder_t enc;
@@ -1810,6 +1856,92 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// gated_delta_net writes [ attention scores | min(n_tokens, K) state snapshots ] and the snapshots
+//   are then scattered into the recurrent state cache by a cpy - see build_recurrent_attn():
+//
+//     GATED_DELTA_NET
+//     VIEW              the snapshot tail of the gated_delta_net dst
+//     CPY               tail -> a view of the recurrent state cache
+//
+// when the cache slots have the layout that the kernel already produces, the kernel can store the
+//   snapshots directly into the cache and the cpy becomes redundant
+//
+// only the snapshot tail view is elided by the fusion, so it is the only node of the pattern that
+//   has to be fully consumed by it - the gated_delta_net is still an output (its attention scores
+//   are consumed downstream) and so is the cpy
+//
+static bool ggml_metal_op_gated_delta_net_fuse_cache(
+        ggml_metal_op_t        ctx,
+        int                    idx,
+        ggml_metal_buffer_id * bid_snap,
+        int32_t              * nss) {
+    const ggml_tensor * op = ctx->node(idx);
+
+    if (op->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // the views are not part of the node list, so the cpy is simply the next node
+    if (idx + 1 >= ctx->n_nodes() || ctx->node(idx + 1)->op != GGML_OP_CPY) {
+        return false;
+    }
+
+    const ggml_tensor * cpy = ctx->node(idx + 1);
+
+    const ggml_tensor * snap  = cpy->src[0]; // the snapshot tail of the gated_delta_net dst
+    const ggml_tensor * cache = cpy->src[1]; // the destination slots in the recurrent state cache
+
+    const int i_op   = ctx->node_gf(idx);
+    const int i_cpy  = ctx->node_gf(idx + 1);
+    const int i_snap = ctx->find_node_gf(snap, i_op + 1, i_cpy);
+
+    if (i_snap < 0) {
+        return false;
+    }
+
+    const int      idxs_gf[3] = { i_op, i_snap, i_cpy };
+    const ggml_op  ops    [3] = { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_CPY };
+
+    if (!ctx->can_fuse_subgraph(idxs_gf, 3, ops, { 0, 2 })) {
+        return false;
+    }
+
+    const int64_t S_v      = op->src[2]->ne[0];
+    const int64_t H        = op->src[2]->ne[1];
+    const int64_t n_tokens = op->src[2]->ne[2];
+    const int64_t n_seqs   = op->src[2]->ne[3];
+
+    const int64_t K = ggml_get_op_params_i32(op, 0);
+
+    const int64_t D = S_v*S_v*H;
+
+    // the kernel writes the newest min(n_tokens, K) slots
+    const int64_t n_snap = std::min<int64_t>(n_tokens, K);
+
+    // the snapshots start right after the attention scores
+    const size_t offs_snap = ggml_row_size(GGML_TYPE_F32, S_v*H*n_tokens*n_seqs);
+
+    if (snap->view_src != op || snap->view_offs != offs_snap || !ggml_is_contiguous(snap)) {
+        return false;
+    }
+
+    // the kernel lays out a slot as [D, n_seqs], so the cache slots must have exactly that layout
+    //   (ggml_cpy already pins the element count of snap to the one of cache)
+    const int64_t ne_snap[GGML_MAX_DIMS] = { D, n_seqs, n_snap, 1 };
+
+    if (cache->type != GGML_TYPE_F32 || cache->data == nullptr ||
+        !std::equal(ne_snap, ne_snap + GGML_MAX_DIMS, cache->ne) ||
+        cache->nb[0] != ggml_type_size(GGML_TYPE_F32) ||
+        cache->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+        return false;
+    }
+
+    *bid_snap = ggml_metal_get_buffer_id(cache);
+    *nss      = K > 1 ? (int32_t) (cache->nb[2]/sizeof(float)) : 0;
+
+    return true;
+}
+
 int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -1825,6 +1957,37 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS(uint64_t, nb2, op->src[2], nb);
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    // where the state snapshots go
+    ggml_metal_buffer_id bid_snap = { nullptr, 0 };
+
+    int32_t nss = 0;
+
+    int n_fuse = 1;
+
+    if (ctx->use_fusion && ggml_metal_op_gated_delta_net_fuse_cache(ctx, idx, &bid_snap, &nss)) {
+        n_fuse = 2;
+
+        if (ctx->debug_fusion > 1) {
+            GGML_LOG_DEBUG("%s: fuse: GATED_DELTA_NET + CPY\n", __func__);
+        }
+    } else {
+        // not fused - the snapshots go into the tail of the dst, right after the attention scores
+        bid_snap = ggml_metal_get_buffer_id(op);
+        bid_snap.offs += ggml_row_size(GGML_TYPE_F32, (int64_t) ne20*ne21*ne22*ne23);
+
+        nss = ne20*ne20*ne21*ne23;
+    }
+
+    if (n_fuse > 1) {
+        for (int i = 1; i < n_fuse; ++i) {
+            if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+                ggml_metal_op_concurrency_reset(ctx);
+
+                break;
+            }
+        }
+    }
 
     auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
 
@@ -1858,6 +2021,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         /*.ns02 =*/ (int32_t) (nb02/sizeof(float)),
         /*.ns12 =*/ (int32_t) (nb12/sizeof(float)),
         /*.ns22 =*/ (int32_t) (nb22/sizeof(float)),
+        /*.nss  =*/ nss,
         /*.ne0  =*/ ne0,
         /*.ne1  =*/ ne1,
         /*.ne2  =*/ ne2,
@@ -1877,12 +2041,13 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // beta
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst
+    ggml_metal_encoder_set_buffer  (enc, bid_snap,                             ida++); // state snapshots
 
     const int nsg = pipeline.nsg;
 
     ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
 
-    return 1;
+    return n_fuse;
 }
 
 int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {
@@ -2291,6 +2456,15 @@ int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// True when the narrow-N mat-mat tile should handle this shape: K-quant weights
+// at a speculative verify width. Upstream sends these either to the small-batch
+// mat-vec, which never reaches the tensor units at all, or to a 128-wide
+// mat-mat tile that discards most of its arithmetic. Delegates the decision so
+// dispatch and pipeline selection cannot disagree about which tile runs.
+static bool ggml_metal_use_narrow_n(const ggml_tensor * op) {
+    return ggml_metal_mul_mm_narrow_nrb(op) > 0;
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -2328,7 +2502,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     // find the break-even point where the matrix-matrix kernel becomes more efficient compared
     // to the matrix-vector kernel
-    const int ne11_mm_min = 8;
+    const int ne11_mm_min = ggml_metal_use_narrow_n(op) ? 1 : 8;
 
     // Register-resident Q4_K mat-vec on the simdgroup matrix units. At these
     // widths mul_mv_ext is scalar and mul_mm pays for threadgroup staging, so
@@ -2338,8 +2512,14 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     static const bool sgq4k_disable = getenv("GGML_METAL_SGMV_DISABLE") != nullptr;
     // per-type opt-out, so each type's contribution can be A/B'd on its own
     static const bool sgq5k_disable = getenv("GGML_METAL_SGMV_NO_Q5K") != nullptr;
+    static const int sgq4k_nmin = getenv("GGML_METAL_SGMV_NMIN")
+                                ? atoi(getenv("GGML_METAL_SGMV_NMIN")) : 3;
 
-    if (!sgq4k_disable &&
+    // The narrow-N tile, where it applies, reaches the tensor units; this kernel
+    // cannot (simdgroup_multiply_accumulate runs on the ordinary ALUs at
+    // 6.1 TFLOP/s, LEDGER 074), so let the tile win wherever it is routed and
+    // use GGML_METAL_NARROW_MIN/MAX to decide where that is.
+    if (!sgq4k_disable && !ggml_metal_use_narrow_n(op) &&
         (op->src[0]->type == GGML_TYPE_Q4_K ||
          (op->src[0]->type == GGML_TYPE_Q5_K && !sgq5k_disable) ||
          op->src[0]->type == GGML_TYPE_Q6_K) &&
@@ -2348,11 +2528,25 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         // they do not use. Measured against the trunk path at m=4096 k=14336:
         // n=2 0.70x, n=3 1.05x, n=4 1.12x, n=5 1.25x, n=8 2.17x. Cost is flat
         // in width (233-235 us for n=2..8) where trunk climbs 163->510 us.
-        ne11 >= 4 && ne11 <= 8 &&
+        // Lower bound is env-selectable so the W=3 pathology can be A/B'd on one
+        // binary. LEDGER 073 measured T_ver(3) = 134.9 ms against T_ver(8) = 111.3:
+        // below this gate K-quants fall back to kernel_mul_mv_q4_K_f32_impl, which
+        // takes the column index as tgpig.y and therefore re-streams all 16.52 GB
+        // once per column. This kernel is flat in width, so covering ne11=3 trades
+        // 3 wasted fragment columns for a whole extra pass over the weights.
+        ne11 >= sgq4k_nmin && ne11 <= 8 &&
         ne00 % 256 == 0 &&
         nb10 == sizeof(float) &&        // src1 contiguous along the reduction
         nb00 == ggml_type_size(op->src[0]->type)) {
-        const int nsg = 4;              // 8*nsg = 32 rows per threadgroup
+        // Simdgroups per threadgroup. Never swept in the integrated kernel --
+        // the probe swept it, but the dispatch has carried a hard 4 since the
+        // kernel landed. It sets occupancy: with rows_sg=16 (Q4_K) and nsg=4 a
+        // threadgroup covers 64 rows, so ne01=5120 gives 80 threadgroups over
+        // 16 cores. Fewer simdgroups means more threadgroups and better load
+        // balance, at the cost of re-reading B more times.
+        static const int nsg_env = getenv("GGML_METAL_SGMV_NSG")
+                                 ? atoi(getenv("GGML_METAL_SGMV_NSG")) : 4;
+        const int nsg = nsg_env;        // rows_sg*nsg rows per threadgroup
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_sgq4k(lib, op, nsg);
 
@@ -2394,7 +2588,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
-    if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
+    if (!ggml_metal_use_narrow_n(op) &&
+        op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
         (
          (
           (
@@ -2413,10 +2608,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            false) && (ne11 >= 2 && ne11 <= 8)
          ) ||
          (
+          // note: Q4_K/Q5_K/Q6_K are deliberately absent - the dedicated multi-column mat-vec
+          //       kernels (kernel_mul_mv_qX_K_f32_r1_N) handle ne11 in [2, 8] for those types and
+          //       are faster than mul_mv_ext, which re-decodes the packed 6-bit scale array per
+          //       16 elements and so scales poorly with the batch size
           (
-           op->src[0]->type == GGML_TYPE_Q4_K ||
-           op->src[0]->type == GGML_TYPE_Q5_K ||
-           op->src[0]->type == GGML_TYPE_Q6_K ||
            op->src[0]->type == GGML_TYPE_Q2_K ||
            op->src[0]->type == GGML_TYPE_Q3_K ||
            false) && (ne11 >= 4 && ne11 <= 8)
@@ -2431,11 +2627,21 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //       my current hypothesis is that the work grid is not evenly divisible for different nsg
         //       values and there can be some tail effects when nsg is high. need to confirm this
         //
-        const int nsg    = 2;                 // num simdgroups per threadgroup
+        // Swept here (LEDGER 004 was opened for exactly this and never measured).
+        // The question is whether this kernel can be tuned to the ~71 ms that
+        // LEDGER 082 says a load-once scalar multi-column mat-vec should reach at
+        // ne11=4, against the 123 ms it delivers today.
+        static const int nsg_env   = getenv("GGML_METAL_EXT_NSG")   ? atoi(getenv("GGML_METAL_EXT_NSG"))   : 0;
+        static const int nxpsg_env = getenv("GGML_METAL_EXT_NXPSG") ? atoi(getenv("GGML_METAL_EXT_NXPSG")) : 0;
+        static const int r1ptg_env = getenv("GGML_METAL_EXT_R1PTG") ? atoi(getenv("GGML_METAL_EXT_R1PTG")) : 0;
+
+        const int nsg    = nsg_env > 0 ? nsg_env : 2;   // num simdgroups per threadgroup
 
         // num threads along row per simdgroup
         int16_t nxpsg = 0;
-        if (ne00 % 256 == 0 && ne11 < 3) {
+        if (nxpsg_env > 0) {
+            nxpsg = (int16_t) nxpsg_env;
+        } else if (ne00 % 256 == 0 && ne11 < 3) {
             nxpsg = 16;
         } else if (ne00 % 128 == 0) {
             nxpsg = 8;
@@ -2463,6 +2669,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             default:
                 GGML_ABORT("unsupported ne11");
         };
+
+        if (r1ptg_env > 0 && r1ptg_env <= ne11) {
+            r1ptg = (int16_t) r1ptg_env;
+        }
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg);
 

@@ -628,6 +628,14 @@ struct llama_model {
     struct ggml_tensor * fc_s = nullptr;
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
+    // FR-Spec (arXiv:2502.14856): optional frequency-ranked row subset of the MTP draft
+    // head. Used ONLY by the MTP draft graph - the target's own LM head stays at full
+    // vocabulary, so the target still verifies every proposal over all n_vocab tokens and
+    // the emitted distribution is unchanged. Both stay null unless LLAMA_MTP_VOCAB_N > 0.
+    // See llama_model_base::build_mtp_vocab_trim().
+    struct ggml_tensor * mtp_head_trim = nullptr;  // {n_embd, n_draft_vocab}, same quant as the full head
+    struct ggml_tensor * mtp_d2t       = nullptr;  // {n_draft_vocab} I64: trimmed row -> full vocab id
+
     // dspark
     struct ggml_tensor * dspark_markov_w1   = nullptr;
     struct ggml_tensor * dspark_markov_w2   = nullptr;
@@ -763,6 +771,10 @@ struct llama_model_base : public llama_model {
     void load_hparams(llama_model_loader & ml) override;
     void load_vocab  (llama_model_loader & ml) override;
     bool load_tensors(llama_model_loader & ml) override;
+
+    // FR-Spec: materialize a frequency-ranked row subset of the MTP draft head into
+    // mtp_head_trim/mtp_d2t. No-op unless LLAMA_MTP_VOCAB_N > 0 and the model has an MTP block.
+    void build_mtp_vocab_trim(llama_model_loader & ml);
 
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;

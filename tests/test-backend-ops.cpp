@@ -4174,6 +4174,138 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GGML_OP_GATED_DELTA_NET + the cpy that scatters its state snapshots into the recurrent state
+// cache, as built by llm_build_delta_net_base::build_recurrent_attn(). fused on some backends.
+//
+// the graph deliberately mirrors the one built by the model:
+//   - the gated_delta_net output has two consumers: the attention-score view and the snapshot tail
+//   - the cpy is expanded first, so the node layout is GATED_DELTA_NET, VIEW, VIEW, CPY and the
+//     attention-score view only shows up further down the graph
+//   - the destination slots are a strided view into a larger recurrent state cache
+struct test_gated_delta_net_cache_fusion : public test_case {
+    const ggml_type type;
+
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int64_t K;       // snapshot slot count: 1 = final state only, >1 = the last K states
+    const int64_t n_cells; // recurrent state cache cells per snapshot slot
+    const int64_t i_cell;  // index of the first cache cell that is written (kv_head)
+
+    ggml_tensor * attn_node = nullptr;
+    ggml_tensor * cpy_node  = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type, head_count, head_size, n_seq_tokens, n_seqs, K, n_cells, i_cell);
+    }
+
+    // keep the op name so that these run together with the plain GATED_DELTA_NET tests
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET";
+    }
+
+    test_gated_delta_net_cache_fusion(ggml_type type = GGML_TYPE_F32,
+            int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
+            int64_t K = 1, int64_t n_cells = 1, int64_t i_cell = 0)
+        : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+          K(K), n_cells(n_cells), i_cell(i_cell) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S = head_size;
+        const int64_t H = head_count;
+        const int64_t D = S*S*H; // per-seq recurrent state size
+
+        // the op writes the newest min(n_seq_tokens, K) slots
+        const int64_t n_snap = std::min<int64_t>(n_seq_tokens, K);
+
+        GGML_ASSERT(i_cell + n_seqs <= n_cells);
+
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, type, S, H, n_seq_tokens, n_seqs);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, type, S, H, n_seq_tokens, n_seqs);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, type, S, H, n_seq_tokens, n_seqs);
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, type, 1, H, n_seq_tokens, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, type, 1, H, n_seq_tokens, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_4d(ctx, type, S, S, H, n_seqs);
+        ggml_set_name(q,     "q");
+        ggml_set_name(k,     "k");
+        ggml_set_name(v,     "v");
+        ggml_set_name(g,     "g");
+        ggml_set_name(beta,  "beta");
+        ggml_set_name(state, "state");
+
+        // q/k are L2-normalised in qwen35/kimi-linear before delta_net
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
+        ggml_set_name(gdn, "gdn");
+
+        // [S, H, n_seq_tokens, n_seqs] attention scores, at the front of the output
+        attn_node = ggml_view_4d(ctx, gdn, S, H, n_seq_tokens, n_seqs,
+                ggml_row_size(gdn->type, S),
+                ggml_row_size(gdn->type, S*H),
+                ggml_row_size(gdn->type, S*H*n_seq_tokens), 0);
+        ggml_set_name(attn_node, "attn");
+
+        // the state snapshots follow right after the attention scores
+        const size_t offs_snap = ggml_row_size(gdn->type, S*H*n_seq_tokens*n_seqs);
+
+        // the recurrent state cache: n_cells states of D elements per snapshot slot
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, D, n_cells*K);
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * snap;
+        ggml_tensor * slots;
+
+        if (K == 1) {
+            // final state only - the model views it as [S, S, H, n_seqs] (build_delta_net_fused)
+            snap = ggml_view_4d(ctx, gdn, S, S, H, n_seqs,
+                    ggml_row_size(gdn->type, S),
+                    ggml_row_size(gdn->type, S*S),
+                    ggml_row_size(gdn->type, S*S*H), offs_snap);
+
+            slots = ggml_view_2d(ctx, cache, D, n_seqs, cache->nb[1], i_cell*cache->nb[1]);
+        } else {
+            snap = ggml_view_3d(ctx, gdn, D, n_seqs, n_snap,
+                    ggml_row_size(gdn->type, D),
+                    ggml_row_size(gdn->type, D*n_seqs), offs_snap);
+
+            slots = ggml_view_3d(ctx, cache, D, n_seqs, n_snap,
+                    cache->nb[1], n_cells*cache->nb[1], i_cell*cache->nb[1]);
+        }
+
+        cpy_node = ggml_cpy(ctx, snap, slots);
+        ggml_set_name(cpy_node, "state_cpy");
+
+        // tie both consumers of the gated_delta_net output into a single root, with the cpy
+        //   visited first so that the node layout matches the one built by the model
+        return ggml_add(ctx,
+                ggml_sum(ctx, ggml_cont(ctx, cpy_node)),
+                ggml_sum(ctx, ggml_cont(ctx, attn_node)));
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { attn_node, cpy_node }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -9792,6 +9924,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
 
+    // gated_delta_net + the cpy that scatters the state snapshots into the recurrent state cache
+    // K == 1: the final state only - this is what plain decode/prefill builds
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  32,  1, 1, /*K=*/1, /*n_cells=*/1, /*i_cell=*/0));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  32,  1, 2, /*K=*/1, /*n_cells=*/4, /*i_cell=*/1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  8,  64,  8, 1, /*K=*/1, /*n_cells=*/4, /*i_cell=*/2));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  32, 16, 2, /*K=*/1, /*n_cells=*/4, /*i_cell=*/1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 32, 128,  1, 1, /*K=*/1, /*n_cells=*/8, /*i_cell=*/3));
+    // K > 1: the rollback snapshots used by speculative decoding, incl. n_tokens < K and n_tokens > K
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  32,  1, 1, /*K=*/2, /*n_cells=*/1, /*i_cell=*/0));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  32,  2, 1, /*K=*/2, /*n_cells=*/4, /*i_cell=*/1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  32,  2, 1, /*K=*/3, /*n_cells=*/4, /*i_cell=*/2));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  64,  4, 1, /*K=*/4, /*n_cells=*/4, /*i_cell=*/1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  8,  32,  4, 2, /*K=*/4, /*n_cells=*/5, /*i_cell=*/2));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32,  4,  32,  8, 1, /*K=*/4, /*n_cells=*/3, /*i_cell=*/1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 32, 128,  4, 1, /*K=*/2, /*n_cells=*/4, /*i_cell=*/1));
+
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
     test_cases.emplace_back(new test_llama(2, true));
@@ -10167,6 +10315,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+
+    // gated_delta_net + the state cache cpy (fused on some backends)
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 32, 128,   1, 1, /*K=*/1, /*n_cells=*/4, /*i_cell=*/1)); // TG-1
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 32, 128,  64, 1, /*K=*/1, /*n_cells=*/4, /*i_cell=*/1)); // PP-64
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 32, 128,  64, 1, /*K=*/2, /*n_cells=*/4, /*i_cell=*/1)); // PP-64,  K=2
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 32, 128, 256, 1, /*K=*/2, /*n_cells=*/4, /*i_cell=*/1)); // PP-256, K=2
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
