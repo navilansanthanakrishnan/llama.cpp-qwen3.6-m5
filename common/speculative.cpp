@@ -2748,7 +2748,47 @@ void common_speculative_draft(common_speculative * spec) {
                     continue;
                 }
 
-                for (int k = 0; k < n_ext && at + k < (int) hist.size(); ++k) {
+                // Fill the verify width, do not just add a fixed n_ext.
+                //
+                // The verify kernel computes a fixed 8-column simdgroup fragment
+                // whatever ne11 is (LEDGER 079), so every drafted token up to the
+                // width budget is free on the verify side. Measured at LEDGER 101:
+                // the draft produces ~4.34 tokens against a budget of 7, because
+                // the MTP chain stops early on p_min and the extension then adds a
+                // fixed 3 regardless. Those unused columns are free acceptance
+                // being discarded. Fill to the budget instead.
+                //
+                // LLAMA_ARG_SPEC_EXT_FILL=0 restores the fixed-n_ext behaviour.
+                static const bool ext_fill = getenv("LLAMA_ARG_SPEC_EXT_FILL")
+                                           ? atoi(getenv("LLAMA_ARG_SPEC_EXT_FILL")) != 0 : true;
+
+                // Width budget: the per-sequence override when set, else the
+                // configured draft width. Defaults to 7, which with the frozen
+                // --spec-draft-n-max 7 is exactly one 8-wide verify fragment.
+                static const int ext_budget = getenv("LLAMA_ARG_SPEC_EXT_BUDGET")
+                                            ? atoi(getenv("LLAMA_ARG_SPEC_EXT_BUDGET")) : 7;
+
+                int n_add = n_ext;
+                if (ext_fill) {
+                    // Fill to the budget and NEVER past it. An earlier version kept a
+                    // floor of n_ext here, which adds tokens even when the budget is
+                    // already spent and trips
+                    //   GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max)
+                    // in llama_context::decode, because the target context sizes its
+                    // output buffer from --spec-draft-n-max at creation.
+                    // dp.n_max is the server's per-sequence override and is derived
+                    // from the REMAINING CONTEXT, so it is routinely far larger than
+                    // the verify width. Take the min, never prefer it: treating it as
+                    // the budget drafts hundreds of tokens and trips
+                    //   GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max)
+                    int budget = ext_budget;
+                    if (dp.n_max > 0) {
+                        budget = std::min(budget, (int) dp.n_max);
+                    }
+                    n_add = std::max(0, budget - (int) result.size());
+                }
+
+                for (int k = 0; k < n_add && at + k < (int) hist.size(); ++k) {
                     result.push_back(hist[at + k]);
                 }
             }
