@@ -15,14 +15,35 @@ standalone Metal probes are in the research repo:
 
 | | before | after |
 |---|---|---|
-| decode, MTP speculative | 14.57 tok/s | **23.76 tok/s** |
-| width-8 verification | 215.2 ms | **110.4 ms** |
-| Q4_K mat-vec, m=4096 k=14336, n=8 | 510 µs | **235 µs** |
+| decode, MTP speculative (steady state) | 14.57 tok/s | **~29.4 tok/s** |
+| width-8 verification | 215.2 ms | **106.6 ms** |
+| Q4_K mat-vec, m=4096 k=14336, n=8 | 510 µs | **229 µs** |
+
+Measured with the frozen interleaved A/B harness in the research repo. A single
+run of this rig is not a level: the first pair of every run reads 1-3 tok/s high
+from a cold cache, and quoting one such reading as the headline is a mistake this
+effort has now made and corrected twice (research LEDGER 063 and 099).
 
 Decode at one token per forward pass is capped at **16.40 tok/s** — 16.5 GB of
 weights over 270.8 GB/s — so everything above that line comes from accepting
 more than one token per pass, and every speculative figure below is reported
 with its acceptance rate.
+
+## What is in this branch
+
+Beyond the register-resident K-quant mat-vec described below:
+
+- **A draft-vocabulary trim for the MTP head** (`LLAMA_MTP_VOCAB_N`, opt-in).
+  Speculative verification is lossless over the full vocabulary regardless, so
+  the *draft* head can be restricted to a frequency-ranked subset. At
+  **N=98304 acceptance is untouched** — mean accepted per forward is identical to
+  three decimals — while the 1.043 GB head read roughly halves. Verified
+  **+6.93%, p=0.0312** on a 6-pair interleaved A/B.
+- **A narrow-N tensor `mul_mm` tile**, gated to `ne11 >= 9`. Above width 8 the
+  K-quant path falls into a 128-column tile and costs a flat 330+ ms; the narrow
+  tile brings that to 180-215. Inert at the widths speculation actually uses.
+- **The `mul_mv_ext`/`mul_mm` width gates re-derived for 16 GPU cores.** Several
+  constants in this space were tuned on a 32-core part and do not transfer.
 
 ## What the kernels do
 
