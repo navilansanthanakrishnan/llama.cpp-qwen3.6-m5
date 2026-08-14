@@ -2373,7 +2373,15 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ne00 % 256 == 0 &&
         nb10 == sizeof(float) &&        // src1 contiguous along the reduction
         nb00 == ggml_type_size(op->src[0]->type)) {
-        const int nsg = 4;              // 8*nsg = 32 rows per threadgroup
+        // Simdgroups per threadgroup. Never swept in the integrated kernel --
+        // the probe swept it, but the dispatch has carried a hard 4 since the
+        // kernel landed. It sets occupancy: with rows_sg=16 (Q4_K) and nsg=4 a
+        // threadgroup covers 64 rows, so ne01=5120 gives 80 threadgroups over
+        // 16 cores. Fewer simdgroups means more threadgroups and better load
+        // balance, at the cost of re-reading B more times.
+        static const int nsg_env = getenv("GGML_METAL_SGMV_NSG")
+                                 ? atoi(getenv("GGML_METAL_SGMV_NSG")) : 4;
+        const int nsg = nsg_env;        // rows_sg*nsg rows per threadgroup
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_sgq4k(lib, op, nsg);
 

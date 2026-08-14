@@ -155,6 +155,9 @@ struct common_speculative_impl {
     int64_t t_begin_us  = 0; // total time spent in refresh of this implementation in microseconds.
     int64_t t_draft_us  = 0; // total time spent in generating drafts in this implementation in microseconds.
     int64_t t_accept_us = 0; // total time spent in accumulation of this implementation in microseconds.
+    int64_t t_process_us = 0; // total time in process(): for MTP this is the catch-up decode that
+                              // advances the draft context's own state over the accepted tokens.
+                              // Untimed until now, and it is a whole extra forward pass per cycle.
 
     common_speculative_impl(common_speculative_type type, uint32_t n_seq) : type(type), n_seq(n_seq) {}
 
@@ -1456,7 +1459,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        //
+        // The catch-up is a whole extra forward pass of the MTP block per cycle,
+        // replaying the tokens the target just decoded so the draft context's own
+        // state advances. Whether qwen35 actually needs it is untested -- the
+        // draft is re-anchored every cycle from the target's hidden state
+        // (pending_h), so the state this rebuilds may be redundant. Skipping it
+        // costs nothing if acceptance holds and saves a forward pass if it does.
+        static const bool skip_catchup = getenv("LLAMA_ARG_SPEC_SKIP_CATCHUP") != nullptr;
+        if (!is_mem_shared && !skip_catchup) {
             common_batch_clear(batch);
 
             for (int k = 0; k < n_tokens; ++k) {
@@ -2567,6 +2578,7 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     }
 
     for (auto & impl : spec->impls) {
+        common_time_meas tm(impl->t_process_us, !impl->gen_perf);
         result = result && impl->process(batch);
     }
 
@@ -2816,8 +2828,9 @@ void common_speculative_print_stats(const common_speculative * spec) {
             std::ostringstream oss;
             oss << std::fixed << std::setprecision(3) << impl->t_begin_us / 1000.0 << ", ";
             oss << std::fixed << std::setprecision(3) << impl->t_draft_us / 1000.0 << ", ";
-            oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0;
-            str_perf = ", dur(b,g,a) = " + oss.str() + " ms";
+            oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0 << ", ";
+            oss << std::fixed << std::setprecision(3) << impl->t_process_us / 1000.0;
+            str_perf = ", dur(begin,draft,accept,process) = " + oss.str() + " ms";
         } else {
             str_perf = "";
         }
