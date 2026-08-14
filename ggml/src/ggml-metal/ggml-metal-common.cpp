@@ -254,6 +254,19 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
         return ggml_mem_ranges_check_dst(mrs, node.dst());
     };
 
+    // the cpy that scatters the state snapshots of a gated_delta_net into the recurrent state cache
+    //   is fused into the gated_delta_net itself (see ggml_metal_op_gated_delta_net), which requires
+    //   the two to stay adjacent - so nothing is allowed to be reordered in front of such a cpy
+    const auto & h_keep_prev = [](const node_info & node) {
+        if (node.op() != GGML_OP_CPY) {
+            return false;
+        }
+
+        const ggml_tensor * src = node.node->src[0];
+
+        return src && src->view_src && src->view_src->op == GGML_OP_GATED_DELTA_NET;
+    };
+
     // perform reorders only across these types of ops
     // can be expanded when needed
     const auto & h_safe = [](ggml_op op) {
@@ -323,9 +336,10 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             h_add(mrs1, node0);
 
             // that many nodes forward to search for a concurrent node
-            constexpr int N_FORWARD = 64;
+            //   (none, if the node has to stay adjacent to the one before it)
+            const int n_forward = h_keep_prev(node0) ? 0 : 64;
 
-            for (int i1 = i0 + 1; i1 < i0 + N_FORWARD && i1 < n; i1++) {
+            for (int i1 = i0 + 1; i1 < i0 + n_forward && i1 < n; i1++) {
                 if (used[i1]) {
                     continue;
                 }

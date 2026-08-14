@@ -88,6 +88,52 @@ struct ggml_metal_op {
         return ggml_can_fuse_ext(gf, idxs.data() + i0, ops, n_ops);
     }
 
+    // index of the node at position i in the original graph
+    int node_gf(int i) const {
+        assert(i >= 0 && i < (int) idxs.size());
+        return idxs[i];
+    }
+
+    // find the graph index of a node in the range [i0_gf, i1_gf) of the original graph, -1 if absent
+    // note: needed because the view/no-op nodes are not in idxs and the metal graph optimizer is
+    //       free to reorder them, so their position relative to a real op is not fixed
+    int find_node_gf(const ggml_tensor * t, int i0_gf, int i1_gf) const {
+        for (int i = std::max(i0_gf, idx_start); i < std::min(i1_gf, idx_end); i++) {
+            if (ggml_graph_node(gf, i) == t) {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    // same as can_fuse(), but for patterns that involve view/no-op nodes - those are not present in
+    //   idxs, so here the nodes are addressed with their indices in the original graph
+    //
+    // outputs are positions, within idxs_gf, of the nodes that are still needed after the fusion -
+    //   all the other nodes of the pattern have to be fully consumed by it
+    //
+    bool can_fuse_subgraph(const int * idxs_gf, int n_ops, const ggml_op * ops, std::initializer_list<int> outputs) const {
+        assert(use_fusion);
+        assert(outputs.size() > 0 && outputs.size() <= GGML_MAX_SRC);
+
+        // note: same as in can_fuse() - never fuse across the boundary of the current split
+        for (int i = 0; i < n_ops; ++i) {
+            if (idxs_gf[i] < idx_start || idxs_gf[i] >= idx_end) {
+                return false;
+            }
+        }
+
+        int idxs_out[GGML_MAX_SRC];
+
+        int n_out = 0;
+        for (int o : outputs) {
+            idxs_out[n_out++] = idxs_gf[o];
+        }
+
+        return ggml_can_fuse_subgraph_ext(gf, idxs_gf, n_ops, ops, idxs_out, n_out);
+    }
+
     ggml_metal_device_t  dev;
     ggml_metal_library_t lib;
     ggml_metal_encoder_t enc;
@@ -1810,6 +1856,92 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// gated_delta_net writes [ attention scores | min(n_tokens, K) state snapshots ] and the snapshots
+//   are then scattered into the recurrent state cache by a cpy - see build_recurrent_attn():
+//
+//     GATED_DELTA_NET
+//     VIEW              the snapshot tail of the gated_delta_net dst
+//     CPY               tail -> a view of the recurrent state cache
+//
+// when the cache slots have the layout that the kernel already produces, the kernel can store the
+//   snapshots directly into the cache and the cpy becomes redundant
+//
+// only the snapshot tail view is elided by the fusion, so it is the only node of the pattern that
+//   has to be fully consumed by it - the gated_delta_net is still an output (its attention scores
+//   are consumed downstream) and so is the cpy
+//
+static bool ggml_metal_op_gated_delta_net_fuse_cache(
+        ggml_metal_op_t        ctx,
+        int                    idx,
+        ggml_metal_buffer_id * bid_snap,
+        int32_t              * nss) {
+    const ggml_tensor * op = ctx->node(idx);
+
+    if (op->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    // the views are not part of the node list, so the cpy is simply the next node
+    if (idx + 1 >= ctx->n_nodes() || ctx->node(idx + 1)->op != GGML_OP_CPY) {
+        return false;
+    }
+
+    const ggml_tensor * cpy = ctx->node(idx + 1);
+
+    const ggml_tensor * snap  = cpy->src[0]; // the snapshot tail of the gated_delta_net dst
+    const ggml_tensor * cache = cpy->src[1]; // the destination slots in the recurrent state cache
+
+    const int i_op   = ctx->node_gf(idx);
+    const int i_cpy  = ctx->node_gf(idx + 1);
+    const int i_snap = ctx->find_node_gf(snap, i_op + 1, i_cpy);
+
+    if (i_snap < 0) {
+        return false;
+    }
+
+    const int      idxs_gf[3] = { i_op, i_snap, i_cpy };
+    const ggml_op  ops    [3] = { GGML_OP_GATED_DELTA_NET, GGML_OP_VIEW, GGML_OP_CPY };
+
+    if (!ctx->can_fuse_subgraph(idxs_gf, 3, ops, { 0, 2 })) {
+        return false;
+    }
+
+    const int64_t S_v      = op->src[2]->ne[0];
+    const int64_t H        = op->src[2]->ne[1];
+    const int64_t n_tokens = op->src[2]->ne[2];
+    const int64_t n_seqs   = op->src[2]->ne[3];
+
+    const int64_t K = ggml_get_op_params_i32(op, 0);
+
+    const int64_t D = S_v*S_v*H;
+
+    // the kernel writes the newest min(n_tokens, K) slots
+    const int64_t n_snap = std::min<int64_t>(n_tokens, K);
+
+    // the snapshots start right after the attention scores
+    const size_t offs_snap = ggml_row_size(GGML_TYPE_F32, S_v*H*n_tokens*n_seqs);
+
+    if (snap->view_src != op || snap->view_offs != offs_snap || !ggml_is_contiguous(snap)) {
+        return false;
+    }
+
+    // the kernel lays out a slot as [D, n_seqs], so the cache slots must have exactly that layout
+    //   (ggml_cpy already pins the element count of snap to the one of cache)
+    const int64_t ne_snap[GGML_MAX_DIMS] = { D, n_seqs, n_snap, 1 };
+
+    if (cache->type != GGML_TYPE_F32 || cache->data == nullptr ||
+        !std::equal(ne_snap, ne_snap + GGML_MAX_DIMS, cache->ne) ||
+        cache->nb[0] != ggml_type_size(GGML_TYPE_F32) ||
+        cache->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+        return false;
+    }
+
+    *bid_snap = ggml_metal_get_buffer_id(cache);
+    *nss      = K > 1 ? (int32_t) (cache->nb[2]/sizeof(float)) : 0;
+
+    return true;
+}
+
 int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -1825,6 +1957,37 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS(uint64_t, nb2, op->src[2], nb);
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    // where the state snapshots go
+    ggml_metal_buffer_id bid_snap = { nullptr, 0 };
+
+    int32_t nss = 0;
+
+    int n_fuse = 1;
+
+    if (ctx->use_fusion && ggml_metal_op_gated_delta_net_fuse_cache(ctx, idx, &bid_snap, &nss)) {
+        n_fuse = 2;
+
+        if (ctx->debug_fusion > 1) {
+            GGML_LOG_DEBUG("%s: fuse: GATED_DELTA_NET + CPY\n", __func__);
+        }
+    } else {
+        // not fused - the snapshots go into the tail of the dst, right after the attention scores
+        bid_snap = ggml_metal_get_buffer_id(op);
+        bid_snap.offs += ggml_row_size(GGML_TYPE_F32, (int64_t) ne20*ne21*ne22*ne23);
+
+        nss = ne20*ne20*ne21*ne23;
+    }
+
+    if (n_fuse > 1) {
+        for (int i = 1; i < n_fuse; ++i) {
+            if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
+                ggml_metal_op_concurrency_reset(ctx);
+
+                break;
+            }
+        }
+    }
 
     auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
 
@@ -1858,6 +2021,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         /*.ns02 =*/ (int32_t) (nb02/sizeof(float)),
         /*.ns12 =*/ (int32_t) (nb12/sizeof(float)),
         /*.ns22 =*/ (int32_t) (nb22/sizeof(float)),
+        /*.nss  =*/ nss,
         /*.ne0  =*/ ne0,
         /*.ne1  =*/ ne1,
         /*.ne2  =*/ ne2,
@@ -1877,12 +2041,13 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // beta
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), ida++); // state
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst
+    ggml_metal_encoder_set_buffer  (enc, bid_snap,                             ida++); // state snapshots
 
     const int nsg = pipeline.nsg;
 
     ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
 
-    return 1;
+    return n_fuse;
 }
 
 int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {
@@ -2443,10 +2608,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            false) && (ne11 >= 2 && ne11 <= 8)
          ) ||
          (
+          // note: Q4_K/Q5_K/Q6_K are deliberately absent - the dedicated multi-column mat-vec
+          //       kernels (kernel_mul_mv_qX_K_f32_r1_N) handle ne11 in [2, 8] for those types and
+          //       are faster than mul_mv_ext, which re-decodes the packed 6-bit scale array per
+          //       16 elements and so scales poorly with the batch size
           (
-           op->src[0]->type == GGML_TYPE_Q4_K ||
-           op->src[0]->type == GGML_TYPE_Q5_K ||
-           op->src[0]->type == GGML_TYPE_Q6_K ||
            op->src[0]->type == GGML_TYPE_Q2_K ||
            op->src[0]->type == GGML_TYPE_Q3_K ||
            false) && (ne11 >= 4 && ne11 <= 8)

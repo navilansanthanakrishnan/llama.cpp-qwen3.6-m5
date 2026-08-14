@@ -905,6 +905,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
+// number of src1 columns that one threadgroup of the multi-column K-quant mat-vec kernels handles.
+// the kernels are instantiated for nr1 = 2, 3, 4; anything else falls back to the nr1 == 1 kernel.
+// for ne11 that is not covered exactly, pick the divisor that wastes the fewest column slots.
+static int ggml_metal_mul_mv_nr1_k(int ne11) {
+    switch (ne11) {
+        case 2:  return 2;
+        case 3:  return 3;
+        case 4:  return 4;
+        case 5:  return 3; // 2 threadgroups, 1 slot wasted
+        case 6:  return 3; // 2 threadgroups, exact
+        case 7:  return 4; // 2 threadgroups, 1 slot wasted
+        case 8:  return 4; // 2 threadgroups, exact
+        default: return 1;
+    }
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
@@ -998,16 +1014,37 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q4_K;
                 nr0 = N_R0_Q4_K;
+
+                const int nr1k = ggml_metal_mul_mv_nr1_k(ne11);
+                if (nr1k > 1) {
+                    nr0    = N_R0_Q4_K_R1;
+                    nr1    = nr1k;
+                    suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3" : "_r1_4";
+                }
             } break;
         case GGML_TYPE_Q5_K:
             {
                 nsg = N_SG_Q5_K;
                 nr0 = N_R0_Q5_K;
+
+                const int nr1k = ggml_metal_mul_mv_nr1_k(ne11);
+                if (nr1k > 1) {
+                    nr0    = N_R0_Q5_K_R1;
+                    nr1    = nr1k;
+                    suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3" : "_r1_4";
+                }
             } break;
         case GGML_TYPE_Q6_K:
             {
                 nsg = N_SG_Q6_K;
                 nr0 = N_R0_Q6_K;
+
+                const int nr1k = ggml_metal_mul_mv_nr1_k(ne11);
+                if (nr1k > 1) {
+                    nr0    = N_R0_Q6_K_R1;
+                    nr1    = nr1k;
+                    suffix = nr1k == 2 ? "_r1_2" : nr1k == 3 ? "_r1_3" : "_r1_4";
+                }
             } break;
         case GGML_TYPE_IQ2_XXS:
             {

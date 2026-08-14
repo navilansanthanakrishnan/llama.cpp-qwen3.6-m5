@@ -637,7 +637,40 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
+
+    // FR-Spec: when a frequency-ranked draft vocabulary was built (LLAMA_MTP_VOCAB_N), the
+    // DRAFT head is a row subset of the full head. This graph is only ever built for
+    // LLM_GRAPH_TYPE_DECODER_MTP, so the target model's own LM head is untouched and still
+    // verifies over the full vocabulary - which is what makes the trim lossless.
+    const bool trim_vocab = model.mtp_head_trim != nullptr;
+    if (trim_vocab) {
+        head_w = model.mtp_head_trim;
+    }
+
     cur = build_lora_mm(head_w, cur, head_s);
+
+    if (trim_vocab) {
+        // scatter the compressed logits back into full-vocab positions, -inf elsewhere, so
+        // that every consumer downstream (draft sampler, token ids handed to the target)
+        // only ever sees full-vocab-shaped, correctly-indexed logits. same construction as
+        // the EAGLE3 d2t path in eagle3.cpp.
+        const int64_t n_draft_vocab = cur->ne[0];
+        const int64_t n_out         = cur->ne[1];
+        const int64_t n_vocab_full  = (int64_t) model.vocab.n_tokens();
+
+        GGML_ASSERT(model.mtp_d2t->type == GGML_TYPE_I64);
+        GGML_ASSERT(model.mtp_d2t->ne[0] == n_draft_vocab);
+
+        ggml_tensor * logits = ggml_fill(ctx0,
+                ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_out), -INFINITY);
+
+        cur = ggml_set_rows(ctx0, logits,
+                ggml_reshape_3d(ctx0, cur,           1,             n_draft_vocab, n_out),
+                ggml_reshape_3d(ctx0, model.mtp_d2t, n_draft_vocab, 1,             1));
+
+        cur = ggml_reshape_2d(ctx0, cur, n_vocab_full, n_out);
+    }
+
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

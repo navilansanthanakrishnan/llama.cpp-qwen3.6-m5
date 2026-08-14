@@ -26,9 +26,12 @@
 #include <algorithm>
 #include <cassert>
 #include <cfloat>
+#include <cinttypes>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <numeric>
@@ -1033,6 +1036,11 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
+    // FR-Spec: storage for the trimmed MTP draft head (see build_mtp_vocab_trim()).
+    // declared ctx-then-buf so the buffer is released before the metadata context.
+    ggml_context_ptr        ctx_mtp_trim;
+    ggml_backend_buffer_ptr buf_mtp_trim;
+
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1697,7 +1705,224 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    build_mtp_vocab_trim(ml);
+
     return true;
+}
+
+// FR-Spec (frequency-ranked speculative sampling, arXiv:2502.14856).
+//
+// Build a row subset of the MTP draft head, keeping only the most frequent tokens of a
+// frozen reference corpus plus every non-normal (control / user-defined / unused) token.
+//
+// WHY THIS IS LOSSLESS: in speculative decoding the draft only PROPOSES. The target model
+// scores every proposal with its own, untouched, full-vocabulary LM head and emits the
+// token. If the true next token is outside the draft's subset the draft proposes something
+// else, the target rejects it, and the target's own token is emitted instead. The emitted
+// sequence is therefore bit-identical; the only effect is a (possibly) lower acceptance
+// rate, which is a throughput effect and not a quality effect.
+//
+// Configuration (both env vars; the feature is inert when unset):
+//   LLAMA_MTP_VOCAB_N    - number of ranked rows to keep. 0 or unset = disabled.
+//   LLAMA_MTP_VOCAB_FILE - path to the ranking: one token id per line, most frequent
+//                          first. '#' comments and blank lines are ignored.
+//
+// The subset is materialized as a contiguous copy in the same quantization as the full
+// head rather than gathered per step: a per-step gather would have to touch the same rows
+// anyway (and dequantize them), which is exactly the cost we are trying to remove.
+void llama_model_base::build_mtp_vocab_trim(llama_model_loader & ml) {
+    const char * env_n = getenv("LLAMA_MTP_VOCAB_N");
+    if (env_n == nullptr) {
+        return;
+    }
+
+    const int64_t n_keep_req = strtoll(env_n, nullptr, 10);
+    if (n_keep_req <= 0) {
+        return;
+    }
+
+    if (!ml.load_mtp || hparams.n_layer_nextn == 0) {
+        LLAMA_LOG_WARN("%s: LLAMA_MTP_VOCAB_N set but this model/context has no MTP head - ignoring\n", __func__);
+        return;
+    }
+
+    const int il_mtp = (int) hparams.n_layer();
+    if (il_mtp < 0 || il_mtp >= (int) layers.size() || layers[il_mtp].nextn.eh_proj == nullptr) {
+        LLAMA_LOG_WARN("%s: LLAMA_MTP_VOCAB_N set but the MTP block was not loaded - ignoring\n", __func__);
+        return;
+    }
+
+    ggml_tensor * head   = layers[il_mtp].nextn.shared_head_head ? layers[il_mtp].nextn.shared_head_head : output;
+    ggml_tensor * head_s = layers[il_mtp].nextn.shared_head_head ? layers[il_mtp].nextn.shared_head_head_s : output_s;
+
+    if (head == nullptr || head->buffer == nullptr) {
+        LLAMA_LOG_WARN("%s: MTP draft head not resident - ignoring LLAMA_MTP_VOCAB_N\n", __func__);
+        return;
+    }
+
+    // a per-row scale would have to be trimmed as well; a scalar scale is fine as-is
+    if (head_s != nullptr && ggml_nelements(head_s) != 1) {
+        LLAMA_LOG_WARN("%s: MTP draft head has a per-row scale - refusing to trim\n", __func__);
+        return;
+    }
+
+    if (!ggml_is_contiguous(head)) {
+        LLAMA_LOG_WARN("%s: MTP draft head is not contiguous - refusing to trim\n", __func__);
+        return;
+    }
+
+    const int64_t n_vocab_full = head->ne[1];
+    if (n_keep_req >= n_vocab_full) {
+        LLAMA_LOG_INFO("%s: LLAMA_MTP_VOCAB_N=%" PRId64 " >= n_vocab=%" PRId64 " - nothing to trim\n",
+                __func__, n_keep_req, n_vocab_full);
+        return;
+    }
+
+    if (head->ne[0] % ggml_blck_size(head->type) != 0) {
+        LLAMA_LOG_WARN("%s: MTP draft head rows are not block-aligned - refusing to trim\n", __func__);
+        return;
+    }
+
+    const char * env_file = getenv("LLAMA_MTP_VOCAB_FILE");
+    if (env_file == nullptr || env_file[0] == '\0') {
+        LLAMA_LOG_ERROR("%s: LLAMA_MTP_VOCAB_N is set but LLAMA_MTP_VOCAB_FILE is not - ignoring\n", __func__);
+        return;
+    }
+
+    std::ifstream fin(env_file);
+    if (!fin) {
+        LLAMA_LOG_ERROR("%s: cannot open LLAMA_MTP_VOCAB_FILE '%s' - ignoring\n", __func__, env_file);
+        return;
+    }
+
+    std::vector<bool>    seen(n_vocab_full, false);
+    std::vector<int64_t> keep;
+    keep.reserve(n_keep_req + 512);
+
+    {
+        std::string line;
+        int64_t n_bad = 0;
+        while ((int64_t) keep.size() < n_keep_req && std::getline(fin, line)) {
+            const size_t pos = line.find_first_not_of(" \t\r\n");
+            if (pos == std::string::npos || line[pos] == '#') {
+                continue;
+            }
+            char * end = nullptr;
+            const long long id = strtoll(line.c_str() + pos, &end, 10);
+            if (end == line.c_str() + pos || id < 0 || id >= n_vocab_full) {
+                n_bad++;
+                continue;
+            }
+            if (seen[id]) {
+                continue;
+            }
+            seen[id] = true;
+            keep.push_back(id);
+        }
+        if (n_bad > 0) {
+            LLAMA_LOG_WARN("%s: %" PRId64 " unparseable/out-of-range entries in '%s'\n", __func__, n_bad, env_file);
+        }
+    }
+
+    if (keep.empty()) {
+        LLAMA_LOG_ERROR("%s: '%s' yielded no usable token ids - ignoring\n", __func__, env_file);
+        return;
+    }
+
+    // Force-include every token that is not a plain "normal" vocabulary entry: BOS/EOS/PAD,
+    // the chat-template control tokens, <think>/</think>, tool-call markers, and so on.
+    // Dropping one of these would change STOPPING behaviour, which is a real behavioural
+    // change even though the logits themselves stay lossless - so they are never ranked out.
+    int64_t n_forced = 0;
+    if ((int64_t) vocab.n_tokens() == n_vocab_full) {
+        for (int64_t id = 0; id < n_vocab_full; ++id) {
+            if (seen[id] || vocab.is_normal((llama_token) id)) {
+                continue;
+            }
+            seen[id] = true;
+            keep.push_back(id);
+            n_forced++;
+        }
+    } else {
+        LLAMA_LOG_WARN("%s: vocab size %u != head rows %" PRId64 " - cannot force-include special tokens\n",
+                __func__, vocab.n_tokens(), n_vocab_full);
+    }
+
+    // sorting only changes which physical row a token lands on (mtp_d2t records the mapping),
+    // but it makes the gather below read the source head front-to-back and lets adjacent ids
+    // coalesce into single copies
+    std::sort(keep.begin(), keep.end());
+
+    const int64_t n_keep = (int64_t) keep.size();
+
+    ggml_init_params ctx_params = {
+        /*.mem_size   =*/ 2 * ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context * ctx = ggml_init(ctx_params);
+    if (ctx == nullptr) {
+        LLAMA_LOG_ERROR("%s: failed to create ggml context for the trimmed MTP head\n", __func__);
+        return;
+    }
+    pimpl->ctx_mtp_trim.reset(ctx);
+
+    ggml_tensor * head_trim = ggml_new_tensor_2d(ctx, head->type, head->ne[0], n_keep);
+    ggml_tensor * d2t_trim  = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_keep);
+
+    ggml_set_name(head_trim, "mtp_head_trim.weight");
+    ggml_set_name(d2t_trim,  "mtp_head_trim.d2t");
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(head->buffer);
+
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+    if (buf == nullptr) {
+        LLAMA_LOG_ERROR("%s: failed to allocate %.2f MiB for the trimmed MTP head - continuing untrimmed\n",
+                __func__, ggml_nbytes(head_trim) / 1024.0 / 1024.0);
+        pimpl->ctx_mtp_trim.reset();
+        return;
+    }
+    pimpl->buf_mtp_trim.reset(buf);
+
+    // gather the kept rows. rows of a contiguous quantized 2d tensor are just fixed-size
+    // byte ranges, so this is a pure memcpy - no dequantization anywhere.
+    {
+        const size_t row_size = ggml_row_size(head->type, head->ne[0]);
+
+        std::vector<uint8_t> staging((size_t) n_keep * row_size);
+
+        int64_t i = 0;
+        while (i < n_keep) {
+            int64_t j = i + 1;
+            while (j < n_keep && keep[j] == keep[j - 1] + 1) {
+                j++;
+            }
+            ggml_backend_tensor_get(head,
+                    staging.data() + (size_t) i * row_size,
+                    (size_t) keep[i] * row_size,
+                    (size_t) (j - i) * row_size);
+            i = j;
+        }
+
+        ggml_backend_tensor_set(head_trim, staging.data(), 0, staging.size());
+    }
+
+    {
+        std::vector<int64_t> d2t_host(keep.begin(), keep.end());
+        ggml_backend_tensor_set(d2t_trim, d2t_host.data(), 0, d2t_host.size() * sizeof(int64_t));
+    }
+
+    mtp_head_trim = head_trim;
+    mtp_d2t       = d2t_trim;
+
+    LLAMA_LOG_INFO("%s: FR-Spec MTP draft vocab trim: %" PRId64 " -> %" PRId64 " rows "
+            "(%.1f%% of vocab, %" PRId64 " forced special tokens), head %s: %.1f -> %.1f MiB, extra %.1f MiB\n",
+            __func__, n_vocab_full, n_keep, 100.0 * n_keep / n_vocab_full, n_forced,
+            ggml_type_name(head->type),
+            ggml_nbytes(head) / 1024.0 / 1024.0,
+            ggml_nbytes(head_trim) / 1024.0 / 1024.0,
+            ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0);
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {

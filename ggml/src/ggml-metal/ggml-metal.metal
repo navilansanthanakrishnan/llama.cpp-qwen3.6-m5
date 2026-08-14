@@ -2662,6 +2662,7 @@ kernel void kernel_gated_delta_net_impl(
         device const char * b,
         device const char * s,
         device       char * dst,
+        device       char * state_out, // tail of dst, or the recurrent state cache when fused
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]])  {
@@ -2704,11 +2705,9 @@ kernel void kernel_gated_delta_net_impl(
 
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K, only slots 0..n_tokens-1 are written; older slots are caller-owned.
+    // The slots live in state_out, args.nss floats apart - either in the tail of dst, or
+    // directly in the recurrent state cache when the scatter cpy has been fused in.
 
-    // output state base offset: after attention scores
-    const uint attn_size = args.ne22 * args.ne21 * S_v * args.ne23;
-    // output state per-slot size: S_v * S_v * H * n_seqs
-    const uint state_size_per_snap = S_v * S_v * args.ne21 * args.ne23;
     // per-(seq,head) offset within a slot
     const uint state_out_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
 
@@ -2763,7 +2762,7 @@ kernel void kernel_gated_delta_net_impl(
         if (K > 1) {
             const int target_slot = (int)args.ne22 - 1 - (int)t;
             if (target_slot >= 0 && target_slot < (int)K) {
-                device float * dst_state = (device float *) (dst) + attn_size + (uint)target_slot * state_size_per_snap + state_out_base;
+                device float * dst_state = (device float *) (state_out) + (uint)target_slot*args.nss + state_out_base;
                 FOR_UNROLL (short j = 0; j < NSG; j++) {
                     const short is = tx*NSG + j;
                     dst_state[is] = ls[j];
@@ -2773,7 +2772,7 @@ kernel void kernel_gated_delta_net_impl(
     }
 
     if (K == 1) {
-        device float * dst_state = (device float *) (dst) + attn_size + state_out_base;
+        device float * dst_state = (device float *) (state_out) + state_out_base;
         FOR_UNROLL (short j = 0; j < NSG; j++) {
             const short is = tx*NSG + j;
             dst_state[is] = ls[j];
@@ -8504,6 +8503,192 @@ kernel void kernel_mul_mv_q4_K_f32(
     kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
+// multi-column (small-batch) variants of the K-quant mat-vec kernels
+//
+// a threadgroup processes nr1 columns of src1 against the same src0 rows, so the src0 traffic and
+// the K-quant scale decoding are paid once instead of nr1 times.
+//
+// three things make this pay off rather than just move the cost around:
+//
+//  * the weights are fully dequantized into registers (w = d*sc*q - dmin*m) and reused by every
+//    column, so no per-column "sumy" pass is needed to fold in the block minimum;
+//  * the nibbles are unpacked four at a time with unpack_unorm4x8_to_float, which turns the
+//    per-element shift/mask/int-to-float chain into one instruction per four weights (the 1/255
+//    the unorm conversion introduces is folded into the scale, costing ~1 ulp on the weight);
+//  * only ONE float4 of activations per column is live at a time. nr1*16 floats of activation, as
+//    a straightforward "load the whole 32-element slice for every column" version needs, drops the
+//    occupancy far enough to more than eat the savings.
+//
+// the 256-element super-block is therefore walked as 8 sub-groups of 4 elements; the per-row scale
+// decode is hoisted out of them and done once per super-block.
+
+// nr1 float4s of activations, one per column, at element offset YOFF of the current super-block
+#define MV_NR1_LOAD_YG(YOFF)                                                     \
+    FOR_UNROLL (short c = 0; c < nr1; ++c) {                                     \
+        device const float * yp = yb + yi + yc[c] + (YOFF);                      \
+        yg[c] = float4(yp[0], yp[1], yp[2], yp[3]);                              \
+    }
+
+// 4 Q4_K weights (one 32-bit chunk of qs) x nr1 columns x nr0 rows.
+// QI picks the 32-bit chunk, SH the nibble (0 = low, 4 = high), SI the sub-block scale.
+#define MV_NR1_Q4_K_SG(YOFF, QI, SH, SI)                                         \
+    {                                                                            \
+        MV_NR1_LOAD_YG(YOFF)                                                     \
+                                                                                 \
+        device const uint * qp = qb + (QI);                                      \
+                                                                                 \
+        FOR_UNROLL (short row = 0; row < nr0; ++row) {                           \
+            const float4 f = unpack_unorm4x8_to_float((qp[0] >> (SH)) & 0x0F0F0F0F); \
+            const float4 w = ds[row][SI]*f - dm[row][SI];                        \
+                                                                                 \
+            FOR_UNROLL (short c = 0; c < nr1; ++c) {                             \
+                sumf[row][c] += dot(w, yg[c]);                                   \
+            }                                                                    \
+                                                                                 \
+            qp += sr4;                                                           \
+        }                                                                        \
+    }
+
+// simd_sum is uniform across the simdgroup, so it stays outside the store predicate
+#define MV_NR1_STORE()                                                           \
+    device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1; \
+                                                                                 \
+    FOR_UNROLL (short c = 0; c < nr1; ++c) {                                     \
+        FOR_UNROLL (short row = 0; row < nr0; ++row) {                           \
+            const float sum_all = simd_sum(sumf[row][c]);                        \
+            if (tiisg == 0 && c < ncols && first_row + row < args.ne0) {         \
+                dst_f32[(int64_t)(r1 + c)*args.ne0 + first_row + row] = sum_all; \
+            }                                                                    \
+        }                                                                        \
+    }
+
+template<int nr0, int nr1, typename args_t>
+void kernel_mul_mv_q4_K_f32_nr1_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const short ix = tiisg/8;  // 0...3
+    const short it = tiisg%8;  // 0...7
+    const short iq = it/4;     // 0 or 1
+    const short ir = it%4;     // 0...3
+
+    const int nb = args.ne00/QK_K;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y*nr1;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_q4_K * x = (device const block_q4_K *) (src0 + offset0);
+
+    // number of src1 columns this threadgroup actually has to produce
+    const short ncols = (short) min((int) nr1, args.ne1 - r1);
+
+    device const float * yb = (device const float *) (src1 + offset1) + 64*iq + 8*ir;
+
+    // per-column element offsets into src1. out-of-range columns alias column r1 so that the loads
+    // stay in bounds - their results are dropped at the store.
+    const int ys = (int) (args.nb11/sizeof(float));
+
+    int yc[nr1];
+
+    FOR_UNROLL (short c = 0; c < nr1; ++c) {
+        yc[c] = (c < ncols ? c : 0)*ys;
+    }
+
+    const uint64_t sr2 = args.nb01/2; // src0 row stride, in uint16 units
+    const uint64_t sr4 = args.nb01/4; // src0 row stride, in uint32 units
+
+    float sumf[nr0][nr1];
+
+    FOR_UNROLL (short row = 0; row < nr0; ++row) {
+        FOR_UNROLL (short c = 0; c < nr1; ++c) {
+            sumf[row][c] = 0.f;
+        }
+    }
+
+    float4 yg[nr1];
+
+    float ds[nr0][4];
+    float dm[nr0][4];
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        {
+            device const uint16_t * sp = (device const uint16_t *)x[ib].scales + iq;
+            device const half     * dp = &x[ib].d;
+
+            FOR_UNROLL (short row = 0; row < nr0; ++row) {
+                const ushort s0 = sp[0];
+                const ushort s2 = sp[2];
+                const ushort s4 = sp[4];
+
+                const ushort sa = s0 & 0x3f3f;
+                const ushort sb = s2 & 0x3f3f;
+                const ushort sc = ((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2);
+                const ushort sd = ((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2);
+
+                // unpack_unorm4x8_to_float yields q/255, so fold the 255 into the block scale
+                const float dv = 255.f*(float) dp[0];
+                const float mv =        (float) dp[1];
+
+                ds[row][0] = dv*(sa & 0xFF); dm[row][0] = mv*(sb & 0xFF);
+                ds[row][1] = dv*(sa >>   8); dm[row][1] = mv*(sb >>   8);
+                ds[row][2] = dv*(sc & 0xFF); dm[row][2] = mv*(sd & 0xFF);
+                ds[row][3] = dv*(sc >>   8); dm[row][3] = mv*(sd >>   8);
+
+                sp += sr2;
+                dp += sr2;
+            }
+        }
+
+        device const uint * qb = (device const uint *)x[ib].qs + 8*iq + 2*ir;
+
+        const int yi = ib*QK_K;
+
+        MV_NR1_Q4_K_SG(  0,  0, 0, 0)
+        MV_NR1_Q4_K_SG(  4,  1, 0, 0)
+        MV_NR1_Q4_K_SG( 32,  0, 4, 1)
+        MV_NR1_Q4_K_SG( 36,  1, 4, 1)
+        MV_NR1_Q4_K_SG(128, 16, 0, 2)
+        MV_NR1_Q4_K_SG(132, 17, 0, 2)
+        MV_NR1_Q4_K_SG(160, 16, 4, 3)
+        MV_NR1_Q4_K_SG(164, 17, 4, 3)
+    }
+
+    MV_NR1_STORE()
+}
+
+#define MUL_MV_NR1_KERNEL(type, NR0, NR1) \
+    [[host_name("kernel_mul_mv_" #type "_f32_r1_" #NR1)]] \
+    kernel void kernel_mul_mv_##type##_f32_r1_##NR1( \
+            constant ggml_metal_kargs_mul_mv & args, \
+            device const char * src0, \
+            device const char * src1, \
+            device       char * dst, \
+            uint3  tgpig[[threadgroup_position_in_grid]], \
+            ushort tiisg[[thread_index_in_simdgroup]], \
+            ushort sgitg[[simdgroup_index_in_threadgroup]]) { \
+        kernel_mul_mv_##type##_f32_nr1_impl<NR0, NR1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg); \
+    }
+
+MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 2)
+MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 3)
+MUL_MV_NR1_KERNEL(q4_K, N_R0_Q4_K_R1, 4)
+
 template<int nr0, typename args_t>
 void kernel_mul_mv_q5_K_f32_impl(
         args_t args,
@@ -8635,6 +8820,150 @@ kernel void kernel_mul_mv_q5_K_f32(
     kernel_mul_mv_q5_K_f32_impl<N_R0_Q5_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
+// multi-column (small-batch) variant of the Q5_K mat-vec kernel - see the Q4_K version for the rationale
+//
+// 4 Q5_K weights x nr1 columns x nr0 rows. HS is the bit position of the matching high bit inside
+// each qh byte; broadcasting it to 0x10 per byte turns the "+16 if set" into three word ops.
+#define MV_NR1_Q5_K_SG(YOFF, QI, HI, SH, HS, SI)                                 \
+    {                                                                            \
+        MV_NR1_LOAD_YG(YOFF)                                                     \
+                                                                                 \
+        device const uint * qp = qb + (QI);                                      \
+        device const uint * hp = hb + (HI);                                      \
+                                                                                 \
+        FOR_UNROLL (short row = 0; row < nr0; ++row) {                           \
+            const uint qv = ((qp[0] >> (SH)) & 0x0F0F0F0F) |                     \
+                            (((hp[0] >> (HS)) & 0x01010101) << 4);               \
+                                                                                 \
+            const float4 f = unpack_unorm4x8_to_float(qv);                       \
+            const float4 w = ds[row][SI]*f - dm[row][SI];                        \
+                                                                                 \
+            FOR_UNROLL (short c = 0; c < nr1; ++c) {                             \
+                sumf[row][c] += dot(w, yg[c]);                                   \
+            }                                                                    \
+                                                                                 \
+            qp += sr4;                                                           \
+            hp += sr4;                                                           \
+        }                                                                        \
+    }
+
+template<int nr0, int nr1, typename args_t>
+void kernel_mul_mv_q5_K_f32_nr1_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const int nb = args.ne00/QK_K;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y*nr1;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_q5_K * x = (device const block_q5_K *) (src0 + offset0);
+
+    const short tid = tiisg/4;
+    const short ix  = tiisg%4;
+    const short iq  = tid/4;
+    const short ir  = tid%4;
+
+    const short ncols = (short) min((int) nr1, args.ne1 - r1);
+
+    device const float * yb = (device const float *) (src1 + offset1) + 64*iq + 8*ir;
+
+    const int ys = (int) (args.nb11/sizeof(float));
+
+    int yc[nr1];
+
+    FOR_UNROLL (short c = 0; c < nr1; ++c) {
+        yc[c] = (c < ncols ? c : 0)*ys;
+    }
+
+    const uint64_t sr2 = args.nb01/2;
+    const uint64_t sr4 = args.nb01/4;
+
+    // bit positions of the 5th bit for the 4 sub-blocks this thread touches
+    const ushort hs0 = 2*iq + 0;
+    const ushort hs1 = 2*iq + 1;
+    const ushort hs2 = 2*iq + 4;
+    const ushort hs3 = 2*iq + 5;
+
+    float sumf[nr0][nr1];
+
+    FOR_UNROLL (short row = 0; row < nr0; ++row) {
+        FOR_UNROLL (short c = 0; c < nr1; ++c) {
+            sumf[row][c] = 0.f;
+        }
+    }
+
+    float4 yg[nr1];
+
+    float ds[nr0][4];
+    float dm[nr0][4];
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        {
+            device const uint16_t * sp = (device const uint16_t *)x[ib].scales + iq;
+            device const half     * dp = &x[ib].d;
+
+            FOR_UNROLL (short row = 0; row < nr0; ++row) {
+                const ushort s0 = sp[0];
+                const ushort s2 = sp[2];
+                const ushort s4 = sp[4];
+
+                const ushort sa = s0 & 0x3f3f;
+                const ushort sb = s2 & 0x3f3f;
+                const ushort sc = ((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2);
+                const ushort sd = ((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2);
+
+                const float dv = 255.f*(float) dp[0];
+                const float mv =        (float) dp[1];
+
+                ds[row][0] = dv*(sa & 0xFF); dm[row][0] = mv*(sb & 0xFF);
+                ds[row][1] = dv*(sa >>   8); dm[row][1] = mv*(sb >>   8);
+                ds[row][2] = dv*(sc & 0xFF); dm[row][2] = mv*(sd & 0xFF);
+                ds[row][3] = dv*(sc >>   8); dm[row][3] = mv*(sd >>   8);
+
+                sp += sr2;
+                dp += sr2;
+            }
+        }
+
+        device const uint * qb = (device const uint *)x[ib].qs + 8*iq + 2*ir;
+        device const uint * hb = (device const uint *)x[ib].qh + 2*ir;
+
+        const int yi = ib*QK_K;
+
+        MV_NR1_Q5_K_SG(  0,  0, 0, 0, hs0, 0)
+        MV_NR1_Q5_K_SG(  4,  1, 1, 0, hs0, 0)
+        MV_NR1_Q5_K_SG( 32,  0, 0, 4, hs1, 1)
+        MV_NR1_Q5_K_SG( 36,  1, 1, 4, hs1, 1)
+        MV_NR1_Q5_K_SG(128, 16, 0, 0, hs2, 2)
+        MV_NR1_Q5_K_SG(132, 17, 1, 0, hs2, 2)
+        MV_NR1_Q5_K_SG(160, 16, 0, 4, hs3, 3)
+        MV_NR1_Q5_K_SG(164, 17, 1, 4, hs3, 3)
+    }
+
+    MV_NR1_STORE()
+}
+
+MUL_MV_NR1_KERNEL(q5_K, N_R0_Q5_K_R1, 2)
+MUL_MV_NR1_KERNEL(q5_K, N_R0_Q5_K_R1, 3)
+MUL_MV_NR1_KERNEL(q5_K, N_R0_Q5_K_R1, 4)
+
 template<int nr0, typename args_t>
 void kernel_mul_mv_q6_K_f32_impl(
         args_t args,
@@ -8742,6 +9071,127 @@ kernel void kernel_mul_mv_q6_K_f32(
 
     kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
+
+// multi-column (small-batch) variant of the Q6_K mat-vec kernel - see the Q4_K version for the rationale
+//
+// block_q6_K is 210 bytes, so a block is only guaranteed 2-byte aligned - the ql/qh planes are read
+// as ushort pairs and reassembled into 32-bit chunks.
+#define MV_NR1_Q6_K_LOAD32(P) ((uint) (P)[0] | ((uint) (P)[1] << 16))
+
+// 4 Q6_K weights x nr1 columns x nr0 rows. QV is the 6-bit value expression (built from the
+// 32-bit low-nibble chunk `ql` and the high-bit chunk `qh`), SI the scale index.
+#define MV_NR1_Q6_K_SG(YOFF, QI, QV, SI)                                         \
+    {                                                                            \
+        MV_NR1_LOAD_YG(YOFF)                                                     \
+                                                                                 \
+        device const ushort * qp = qb + (QI);                                    \
+        device const ushort * hp = hb;                                           \
+        device const int8_t * sp = sb;                                           \
+        device const half   * dp = db;                                           \
+                                                                                 \
+        FOR_UNROLL (short row = 0; row < nr0; ++row) {                           \
+            const uint ql = MV_NR1_Q6_K_LOAD32(qp);                              \
+            const uint qh = MV_NR1_Q6_K_LOAD32(hp);                              \
+                                                                                 \
+            const float a = (float) dp[0] * sp[SI];                              \
+                                                                                 \
+            const float4 f = unpack_unorm4x8_to_float(QV);                       \
+            const float4 w = (255.f*a)*f - (32.f*a);                             \
+                                                                                 \
+            FOR_UNROLL (short c = 0; c < nr1; ++c) {                             \
+                sumf[row][c] += dot(w, yg[c]);                                   \
+            }                                                                    \
+                                                                                 \
+            qp += sr2;                                                           \
+            hp += sr2;                                                           \
+            sp += args.nb01;                                                     \
+            dp += sr2;                                                           \
+        }                                                                        \
+    }
+
+template<int nr0, int nr1, typename args_t>
+void kernel_mul_mv_q6_K_f32_nr1_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    const int nb = args.ne00/QK_K;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y*nr1;
+    const int im = tgpig.z;
+
+    const int first_row = (r0 * NSG + sgitg) * nr0;
+
+    const uint i12 = im%FC_mul_mv_ne12;
+    const uint i13 = im/FC_mul_mv_ne12;
+
+    const uint64_t offset0 = first_row*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
+
+    device const block_q6_K * x = (device const block_q6_K *) (src0 + offset0);
+
+    const short tid = tiisg/2;
+    const short ix  = tiisg%2;
+    const short ip  = tid/8;         // 0 or 1
+    const short il  = tid%8;
+    const short l0  = 4*il;
+    const short is  = 8*ip + l0/16;
+
+    const short y_offset   = 128*ip + l0;
+    const short q_offset_l =  64*ip + l0;
+    const short q_offset_h =  32*ip + l0;
+
+    const short ncols = (short) min((int) nr1, args.ne1 - r1);
+
+    device const float * yb = (device const float *) (src1 + offset1) + y_offset;
+
+    const int ys = (int) (args.nb11/sizeof(float));
+
+    int yc[nr1];
+
+    FOR_UNROLL (short c = 0; c < nr1; ++c) {
+        yc[c] = (c < ncols ? c : 0)*ys;
+    }
+
+    const uint64_t sr2 = args.nb01/2;
+
+    float sumf[nr0][nr1];
+
+    FOR_UNROLL (short row = 0; row < nr0; ++row) {
+        FOR_UNROLL (short c = 0; c < nr1; ++c) {
+            sumf[row][c] = 0.f;
+        }
+    }
+
+    float4 yg[nr1];
+
+    for (int ib = ix; ib < nb; ib += 2) {
+        device const ushort * qb = (device const ushort *)(x[ib].ql + q_offset_l);
+        device const ushort * hb = (device const ushort *)(x[ib].qh + q_offset_h);
+        device const int8_t * sb = x[ib].scales + is;
+        device const half   * db = &x[ib].d;
+
+        const int yi = ib*QK_K;
+
+        MV_NR1_Q6_K_SG( 0, 0, ( (ql        & 0x0F0F0F0F) | ((qh & 0x03030303) << 4)), 0)
+        MV_NR1_Q6_K_SG(32, 16, ((ql        & 0x0F0F0F0F) | ((qh & 0x0C0C0C0C) << 2)), 2)
+        MV_NR1_Q6_K_SG(64, 0, (((ql >> 4)  & 0x0F0F0F0F) |  (qh & 0x30303030)      ), 4)
+        MV_NR1_Q6_K_SG(96, 16, (((ql >> 4) & 0x0F0F0F0F) | ((qh & 0xC0C0C0C0) >> 2)), 6)
+    }
+
+    MV_NR1_STORE()
+}
+
+MUL_MV_NR1_KERNEL(q6_K, N_R0_Q6_K_R1, 2)
+MUL_MV_NR1_KERNEL(q6_K, N_R0_Q6_K_R1, 3)
+MUL_MV_NR1_KERNEL(q6_K, N_R0_Q6_K_R1, 4)
 
 // ======================= "True" 2-bit
 
